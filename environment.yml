@@ -1,0 +1,11 @@
+name: backout-backprop
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - numpy>=2
+      - torch>=2.6
+      - pytest>=8
