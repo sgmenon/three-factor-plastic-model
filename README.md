@@ -26,29 +26,7 @@ Our local method will also have costs: neurons store input histories, and correc
 
 Later experiments will test larger networks and longer videos. Pruning should also make prediction cheaper over time by removing connections that the network does not need. A failed experiment can still teach us whether the problem was assigning feedback, remembering older events, keeping the network stable, or finding a useful set of connections.
 
-## Two learning problems
-
-### 1. Neurons that fire in discrete steps
-
-A hard threshold jumps directly from off to on. There is no useful derivative at the point where it jumps, so ordinary backpropagation cannot pass a gradient through that event. Spiking neural networks usually work around this by pretending that the jump has a smooth derivative during the backward pass [[15](#references)].
-
-A step function by itself is not a realistic biological neuron. A real neuron builds up electrical charge over time, fires a spike after crossing a threshold, needs time before firing again, and is affected by noise. We eventually want to compare neuron models that include these changes over time.
-
-A derivative is not required by the simple correction rule below. A smooth activation is still useful as an engineering control because a small weight change usually produces a small, visible change in the neuron's output. With a hard threshold, many weight changes do nothing until the neuron crosses the threshold, at which point its output changes suddenly. That can make it harder to tell whether a correction helped.
-
-Success with smooth neurons would not prove that hard-threshold neurons will learn. It would only show that the active-path correction works when neuron outputs change gradually. This separates two questions:
-
-1. Can local feedback train a network without end-to-end backpropagation?
-2. Can the same idea work when neuron outputs are discrete and no real derivative exists?
-
-The first question is the main experiment. The second is an optional, harder follow-up motivated by biology. If we pursue it, use the same derivative-free active-path correction rule in both cases and change only the neuron activation:
-
-1. smooth neurons whose outputs change gradually; and
-2. hard-threshold or spiking neurons whose outputs are discrete.
-
-This direct comparison will tell us whether discontinuous firing itself prevents the simple correction rule from learning. Surrogate derivatives and established three-factor spiking rules can be added later as reference methods [[8](#references), [15](#references)], but they should not be part of the initial hypothesis.
-
-### 2. Deciding which connection deserves credit
+## Deciding which connection deserves credit
 
 Knowing that the final prediction is wrong does not tell us which hidden connection caused the mistake. This is called the **credit-assignment problem**. A single score can say whether the whole network did well, but it cannot say which connection helped or hurt.
 
@@ -74,29 +52,35 @@ $$
 w_{ij} \leftarrow w_{ij} + \eta_w C_j x_i
 $$
 
-Here $x_i$ is the exact input that neuron $j$ recorded from connection $i \rightarrow j$ during that prediction. If $x_i$ was zero or the receiving neuron did not activate, that connection is not updated. For a smooth activation, “active” means that its output exceeded a small chosen threshold; for a spiking neuron, it means that it fired. This is intentionally simpler than backpropagation: it does not calculate a chain of derivatives or use a separate feedback network.
+Here $x_i$ is the exact input that neuron $j$ recorded from connection $i \rightarrow j$ during that prediction. If $x_i$ was zero or the ReLU connection did not activate, that connection is not updated. This is intentionally simpler than backpropagation: it does not calculate a chain of derivatives or use a separate feedback network.
 
-### Reinforcing successful paths
-
-A small correction should produce reward only when the network correctly predicted a **non-trivial change**. Zero error for a stationary object or unchanged pixel is not evidence that the active path learned useful dynamics. Exact zero will also be rare with floating-point outputs, so define an error tolerance $\epsilon$, a minimum meaningful target change $\delta$, and:
+Weight correction keeps a fixed scale and is therefore proportional to the recorded source activation. Connection bias uses a bounded proportional-integral (PI) correction. Each connection keeps a small integral trace of the corrections that have reached it:
 
 $$
-r =
-\mathbb{1}\left[|\Delta x_{\text{target}}| > \delta\right]
-\max\left(0, 1 - \frac{|e|}{\epsilon}\right)
+I_{ij}[t]
+=
+\operatorname{clip}\left(
+\lambda I_{ij}[t-1]+c_{ij}[t],
+-I_{\max},
+I_{\max}
+\right)
 $$
 
-The indicator is zero for stationary targets, so they produce no reward even when their error is zero. For video, this gate can be computed per output pixel or patch before reward travels backward over the same active path as correction. Reward does not require a new neuron-level gain value. Instead, it reuses the connection bias:
-
 $$
-b_{jk} \leftarrow \max\left(0,\ b_{jk} - \eta_b c_{j \leftarrow k} - \eta_r r_{j \leftarrow k}\right)
+\Delta b_{ij}[t]
+=
+K_Pc_{ij}[t]+K_II_{ij}[t],
+\qquad
+b_{ij}\leftarrow b_{ij}-\Delta b_{ij}[t].
 $$
 
-The correction term still opens or closes the connection according to the signed error. The smaller reward term opens a connection slightly when it repeatedly participates in low-error predictions. That connection will then activate more often, participate in more future correction votes, and be less likely to be removed during pruning. Neurons already store the error and activity history needed to measure repeated success, so this does not add a separate gain parameter.
+The proportional term reacts to the current error. The integral term remembers a persistent error and adds a gradually increasing push in the same direction. Opposite errors unwind that memory instead of resetting it abruptly. The decay $\lambda<1$ and limit $I_{\max}$ prevent old errors from accumulating without bound. The trace is updated only when a nonzero correction actually passes through an active connection; an inactive connection receives neither correction nor reward.
 
-This mechanism could counteract noisy constant-rate updates by making successful routes easier to reuse, but it can also create runaway activation: opening a connection changes a prediction that was already correct. The reinforcement rate should therefore be much smaller than the correction rate, bias should remain nonnegative, and each neuron should have a budget limiting how many incoming connections can be strongly active. The initial experiment should compare no reinforcement against several small reinforcement rates rather than assume that reinforcement improves convergence.
+This is still local: $c_{ij}$ is the correction already travelling through connection $i\rightarrow j$. It does not require a derivative, a replayed forward pass, or a separate feedback matrix. Unlike the earlier same-sign rule, it grows linearly with accumulated error rather than doubling exponentially. That earlier rule is retained in [Unsuccessful and inconclusive experiments](UNSUCCESSFUL_EXPERIMENTS.md).
 
-The first moving-dot ablation does not yet show a clear general benefit. Across five seeds after 10,000 observations, a reinforcement rate of $10^{-4}$ produced nearly identical mean error and rollout accuracy to no reinforcement, slightly lower one-step accuracy, and a small increase in active edges. In one 100,000-observation run, stronger reinforcement improved eight-step rollout accuracy from `25.0%` to `27.3%`, but reduced one-step accuracy and opened more connections. This suggests a possible memory-versus-precision trade-off, not a convergence fix. Reinforcement should remain optional until that result is reproduced across more seeds.
+### Ideas removed from the active rule
+
+Positive-only reinforcement, centered reinforcement, signed pruning votes, and connection-pair merging were implemented but did not show useful improvements. They remain documented with equations and measurements in [Unsuccessful and inconclusive experiments](UNSUCCESSFUL_EXPERIMENTS.md), rather than being presented as parts of the current proposal.
 
 This simplicity is also the main risk. The same correction may not be appropriate for every active connection, especially when weights can be negative or several paths cancel each other. The purpose of the first experiment is to find out whether this rough active-path correction is still enough to reach a useful solution. If it fails, later versions can test weight signs, local slopes, eligibility traces, or random feedback one at a time instead of assuming them from the start.
 
@@ -107,35 +91,46 @@ Hinton's Forward-Forward algorithm is another useful comparison. It trains each 
 ### State and connectivity
 
 - Start with a small network in which only some possible connections are active.
-- Every neuron keeps a history of each input value it received, the connection that supplied it, the connection's weight and bias, its summed input, and its output. Each record is tagged with the frame or prediction that created it so the arriving correction can use the matching inputs.
-- Each neuron also has a running state that carries some information from one frame to the next. A simple first version is $h_t = \alpha h_{t-1} + (1-\alpha)\,\text{new activation}$, where $\alpha$ controls how quickly old activity fades.
+- For the current prediction, every neuron keeps the exact input and active path needed when its matching correction arrives. Between pruning events, the implementation keeps only activity counts and pruning votes; it does not keep old activation signatures whose meaning would become stale as weights and biases change.
+- Ordinary hidden neurons are stateless between video frames. Remembering an input briefly until its matching correction arrives is training bookkeeping, not temporal neuron state.
+- Keep stateful memory neurons as a separate future class. An NMDA-inspired memory neuron may eventually retain and amplify selected activity, but ordinary hidden neurons should not acquire that behavior implicitly.
+- The current experiment uses a simple one-frame input delay so it can observe motion before introducing learned memory neurons. It supplies the current and previous frames to the first hidden layer with independent connections.
 - Include ordinary forward connections, shortcuts, and a limited number of sideways or backward connections.
-- A connection stores no learning history or eligibility state. It identifies the two neurons it joins and carries only its current weight and connection-specific bias. The neurons own the history. Bias is updated when an individual correction passes through; weight is updated after the receiving neuron has aggregated its corrections.
+- A connection carries its current weight, connection-specific bias, and one bounded PI integral trace. Bias is updated when an individual correction passes through; weight is updated from the receiving neuron's aggregate correction multiplied by the connection's recorded input. Ordinary pruning preserves the traces of surviving connections, discards removed traces, and initializes newly created connections at zero.
 - Predict how the next frame will differ from the current frame instead of generating the whole next frame from scratch.
 
-For input $x_i[k]$ at discrete time $k$, connection $i \rightarrow j$ produces:
+At time $k$, the input delay constructs
 
 $$
-q_{ij}[k] = \operatorname{ReLU}(x_i[k]w_{ij}[k] - b_{ij}[k])
+z[k]=[x[k],x[k-1]].
 $$
 
-Neuron $j$ adds the outputs of its active incoming connections:
+Each connection into an ordinary hidden neuron then produces
 
 $$
-h_j[k] = \sum_i q_{ij}[k]
+q_{ij}[k] = \operatorname{ReLU}(z_i[k]w_{ij}[k] - b_{ij}[k]),
 $$
 
-This equation makes every connection output nonnegative. A negative weight or a large positive bias suppresses a connection rather than sending a negative value to the next neuron. If active inhibition is needed later, it must be represented by a different connection equation; the initial experiment treats inhibition as connection-level suppression. Because a frame delta can be positive or negative, the output should use separate positive and negative channels and subtract them: $\widehat{\Delta x}=\widehat{\Delta x}^{+}-\widehat{\Delta x}^{-}$.
+and the neuron sums its incoming contributions:
+
+$$
+h_j[k] = \sum_i q_{ij}[k].
+$$
+
+The first frame of a clip initializes the input delay, and prediction training begins with the second frame. No hidden activation is carried into the next time step. Current-frame and delayed-frame connections have independent weights and gates, so the model can learn how much each source matters instead of being forced to use a fixed temporal difference.
+
+Each connection output is nonnegative. A negative weight or a large positive bias suppresses a connection rather than sending a negative contribution directly. If active inhibition is needed later, it must be represented by a different connection equation; the initial experiment treats inhibition as connection-level suppression. Because a frame delta can be positive or negative, the output uses separate positive and negative channels and subtracts them: $\widehat{\Delta x}=\widehat{\Delta x}^{+}-\widehat{\Delta x}^{-}$.
 
 The whole system is discrete-time by construction:
 
 $$
-h[k+1] = F(h[k], x[k]; w[k], b[k])
+z[k]=[x[k],x[k-1]], \qquad
+h[k] = F(z[k]; w[k], b[k]).
 $$
 
-Recurrent and sideways connections read the stored state from time $k$ to produce time $k+1$; they do not propagate continuously inside one time step. When the real frame at $k+1$ arrives, its correction is matched with the recorded active paths from prediction $k$. The resulting parameter changes are used for later predictions.
+Future memory, recurrent, or sideways neurons will read explicitly stored state from time $k$ to produce time $k+1$; they will not propagate continuously inside one time step. When the real frame at $k+1$ arrives, its correction is matched with the recorded active paths from prediction $k$. The resulting parameter changes are used for later predictions.
 
-Input history grows between pruning events. After a pruning event has used that history to find weak and redundant connections, the old history is cleared and the neurons begin recording a new period. The pruning interval therefore sets the maximum history size.
+Activity counters grow between pruning events. After pruning has used them to find weak connections, they are cleared and a new window begins. Neuron merging instead re-evaluates the current network on a fixed probe set at pruning time.
 
 Purkinje and granule cells are useful inspiration, but looking biologically similar does not prove that two systems learn in the same way. Any biological analogy should lead to a specific idea we can test.
 
@@ -147,14 +142,23 @@ Later, it will enter a cleanup phase and remove more connections than it creates
 
 A connection has its own bias, which acts like a gate on that connection. If correction repeatedly pushes the bias so far that the connection almost never activates, the connection serves little purpose and is a pruning candidate. Removing it may not save much arithmetic because it was already inactive, but it removes its lookup, routing, and history overhead.
 
-The larger computational savings should come from merging redundant active connections. At pruning time, compare the histories of connections entering the same neuron:
+The larger computational savings may come from merging redundant neurons rather than individual connections. At each merge attempt, the moving-dot experiment re-runs all 288 position-and-direction states through the current network. This avoids deciding from an old path that may have changed since it was recorded. Merging is directional: remove neuron A only when its behavior is contained by survivor B.
 
-- If two source neurons almost always fire together and their connections have similar effects, keep one connection and remove the other.
-- Increase the surviving weight enough to preserve their combined contribution. If the two source activations are nearly equal, a first approximation is $w_{\text{keep}} \leftarrow w_{\text{keep}} + w_{\text{remove}}$. If one activation is usually a fixed proportion of the other, scale the transferred weight by that proportion.
-- Prefer keeping connections that repeatedly participated in low-error predictions, using the reward and error records already present in neuron history.
-- Temporarily removing the candidate and checking whether prediction error changes can prevent useful connections from being merged accidentally.
+- Incoming containment is $|A_{\mathrm{in}}\cap B_{\mathrm{in}}|/|A_{\mathrm{in}}|$; B is allowed to respond to additional inputs.
+- Outgoing containment is measured in the same direction; B is allowed to affect additional targets.
+- Where A is active, its output must be approximately proportional to B's output. Matching binary activation alone is insufficient.
+- Fit B's incoming weights and biases to reconstruct the combined hidden output $A+B$, then fit its outgoing weights and biases to reconstruct both neurons' former contributions.
+- Accept the merge only when every affected outgoing target remains within a chosen reconstruction-error tolerance; then remove all incoming and outgoing edges belonging to the redundant neuron.
 
-After pruning finishes, clear the history used for that decision. Comparing every possible pair can be expensive for a neuron with many inputs, so the first version can compare only active connections or use the full comparison during infrequent pruning events.
+Bias adjustment alone cannot generally absorb A: changing a bias adds a constant offset while A's contribution varies with its input and weight. Fitting both weight and bias is the smallest affine correction that can represent a varying contribution. The exhaustive reconstruction check decides whether that approximation is actually safe.
+
+If two hidden outputs are proportional, $h_b\approx\alpha h_a$, their outgoing weights can be folded as
+
+$$
+w'=\frac{w_a+\alpha w_b}{1+\alpha}, \qquad b'=b_a+b_b.
+$$
+
+The code does not assume these approximations are safe: it reconstructs the merged hidden output and every affected outgoing contribution on all 288 states, then rejects the merge if the relative error is too large. This is stricter than matching Jaccard signatures alone.
 
 Pruning is also responsible for exploration. At every pruning event, randomly reactivate a small fraction of inactive connections when nearby neurons have been active and firing. Reset their bias so they can open, give them a small weight, and protect them from immediate re-pruning for one history period. This gives mistakenly suppressed paths a chance to become useful again.
 
@@ -162,21 +166,17 @@ Completely new connections can be chosen randomly at first. Later, we can test w
 
 Other research has shown that changing a network's wiring during training can help, although strong methods such as RigL use gradients to choose new connections [[10](#references)]. We want to learn whether local signals are enough.
 
-The moving-dot pruning experiment removes connections that were never active during the preceding 1,000-observation window and randomly reactivates `5%` of the removed count near endpoints that were active.
+The moving-dot pruning experiment removes connections that were never active during the preceding 1,000-observation window and randomly reactivates `5%` of the removed count near endpoints that were active. Training uses overlapping transitions from continuous ten-frame trajectories. On the old explicit two-frame architecture, across five seeds after 10,000 observations:
 
-An early version trained on independently sampled three-frame transitions. Across five seeds, pruning improved mean one-step position accuracy from `70.0%` to `72.6%`. The advantage appeared after 4,000 observations and grew to about 2.6 percentage points by 10,000 observations.
+- no pruning reaches `74.7%` mean one-step accuracy and `15.9%` rollout accuracy;
+- periodic inactive-edge pruning keeps `54.6%` of connections and reaches `72.2%` one-step and `15.9%` rollout accuracy; and
+- mean MSE remains nearly identical: `0.01994` without pruning and `0.01992` with pruning.
 
-That sampling was not continuous video: every update began from a new random state. Training now uses overlapping transitions from ten-frame trajectories. With this correction, five-seed results after 10,000 observations are:
+Pruning therefore compressed that architecture substantially with a modest one-step accuracy cost. A later controlled five-seed test at width 86 exposed an implementation error specific to PI: rebuilding the edge lists reset the integral traces of every surviving connection. At 10,000 observations, matched proportional-only correction reached `89.4%` without pruning and `90.0%` with pruning; PI reached `92.0%` without pruning but only `89.3%` when its traces were reset every 1,000 observations. Preserving surviving traces, deleting only removed traces, and giving reactivated edges zero-valued traces raises pruned PI to `93.6%`. Pruning can therefore coexist with PI; the integral memory must follow the stable identity of each surviving edge.
 
-- no pruning reaches `73.8%` mean one-step accuracy and `15.6%` rollout accuracy;
-- periodic pruning keeps `54.7%` of connections and reaches `73.6%` one-step and `16.4%` rollout accuracy; and
-- mean MSE remains nearly identical: `0.01994` without pruning and `0.01991` with pruning.
+The neuron-level merge implementation still correctly collapses deliberately duplicated ReLU neurons while preserving their historical outgoing contribution. A successful merge reconstructs several edges rather than preserving their identity, so it still initializes the affected PI traces again; naturally learned merges have not yet occurred in this model.
 
-Pruning therefore still compresses the network with essentially no accuracy loss, but the earlier convergence improvement does not reproduce on continuous clips. It may have depended on shuffled state coverage rather than pruning itself.
-
-The next experiment stores every source value during each pruning window. For connections entering the same neuron, it compares their historical contribution patterns. When two patterns have at least `95%` cosine similarity, it fits one surviving connection to their combined historical output and accepts the merge only if its relative reconstruction error is at most `10%`. No more than `5%` of a neuron's present inputs can be merged in one event.
-
-On continuous ten-frame clips, this conservative merge test finds only `7.2` merge opportunities on average across five seeds and 10,000 observations. Mean one-step accuracy is `73.3%`, rollout accuracy is `15.7%`, and final connection presence remains about `54.6%`. The mechanism works on exact duplicate histories, but this network has few safely interchangeable active paths. We should treat that as a useful negative result: history-based merging is implemented, but it has not yet added meaningful compression or convergence improvement.
+Directional containment is a better candidate test than symmetric Jaccard similarity, but it does not change the result on this small model. Across five seeds, containment thresholds `0.95`, `0.80`, `0.60`, `0.40`, and `0.30` all produce zero merges at `10%` reconstruction tolerance. In one representative seed, the strongest directed candidate has incoming containment `0.656`, outgoing containment `0.415`, and conditional output cosine similarity `0.716`. Its outgoing behavior is not close to being a subset, and reconstruction rejects it. The safe interpretation remains that this model contains no behavior-preserving neuron redundancy. A larger and deeper model will provide a more meaningful test. Earlier misleading or ineffective pruning and merging attempts are recorded in [Unsuccessful and inconclusive experiments](UNSUCCESSFUL_EXPERIMENTS.md).
 
 Connections are now stored as physical edge lists containing source index, target index, weight, and bias. Pruning consumes and clears the current history, then removes entries from these arrays; reactivation appends only source-target pairs that do not already exist. Forward and correction propagation therefore visit present connections rather than multiplying a dense matrix by a presence mask.
 
@@ -186,7 +186,19 @@ Having fewer connections still does not automatically make a program faster. Sca
 
 While “awake,” the network receives real video, predicts the next frame, and saves a small number of recent sequences. During a later “sleep” phase, it receives no new video. It replays saved or imagined sequences while adjusting connections. Earlier work suggests that replay can reduce forgetting [[11](#references)].
 
-We should not begin with an LSTM memory block because LSTMs are normally trained by backpropagation through time. Start with simple fading neuron states and saved sequences. Add sleep only after the awake-only network has learned something useful.
+An LSTM is probably the wrong memory primitive for this system: its gates are learned, normally by backpropagation through time, whereas this experiment needs storage that works before anything is trained. Start with an untrained, dimension-preserving memory block. For an $n$-value input, it has an $n$-value output and acts as a one-step delay:
+
+$$
+y[k]=m[k], \qquad m[k+1]=x[k].
+$$
+
+A longer block is a bounded FIFO or ring buffer containing $L$ such vectors. It introduces no learned weights or gates; its explicit cost is $O(Ln)$ memory. This gives the network access to an earlier signal without asking a neuron to discover how to preserve it.
+
+During ordinary forward operation, the block receives a signal from upstream, stores it, and transmits the preceding signal downstream. During replay, it emits the stored sequence in reverse temporal order, from newest to oldest. Biological reverse replay is observed in hippocampal place-cell sequences, although that observation does not establish that the same mechanism will help this learner [[18](#references)].
+
+Reversing time and reversing network direction are different experiments. The first version should reverse only temporal order while using the ordinary forward path. A later bidirectional version can replay toward the neurons that originally produced the signal, but it will need explicit ports and a rule preventing a replayed value from being immediately written back into the same buffer.
+
+This memory block does not solve credit assignment or compress its contents; it simply makes recent state available. Compare no memory, one-step delay, short FIFO, forward replay, and reverse replay. Add sleep only after the awake-only network has learned something useful.
 
 ### Weights as temporal memory
 
@@ -242,9 +254,9 @@ This tests the intended consensus behavior before replacing scalar input with mo
 
 ### Stage 0: verify credit assignment
 
-Start with fixed-rate grayscale video containing one object moving at constant velocity and bouncing elastically from the frame boundaries. The first implementation supplies both the previous and current frame so velocity is observable; this is explicit state, which a later experiment can replace with learned recurrent state. Each training step follows the intended operating loop:
+Start with fixed-rate grayscale video containing one object moving at constant velocity and bouncing elastically from the frame boundaries. A one-frame input delay supplies the current and previous frames to the first hidden layer; every hidden layer itself remains stateless. Each later training step follows the intended operating loop:
 
-1. present the previous and current frames $x_{t-1},x_t$;
+1. present the current frame $x_t$;
 2. predict the frame delta $\widehat{\Delta x_t}$;
 3. form the next-frame prediction $\hat{x}_{t+1}=x_t+\widehat{\Delta x_t}$;
 4. reveal the real next frame $x_{t+1}$;
@@ -262,7 +274,7 @@ Next, give the network movement paths that it did not see during training. Test 
 
 Measure image error, the error in the object's predicted position, the number of active connections, update time, and results across several random starting networks.
 
-We also need to prove that the hidden connections are learning. Compare the full network with a version in which hidden weights are frozen and only the final output weights can change. Also compare it with an untrained network and a simple guess that the next frame will equal the current one.
+The frozen-hidden ablation tests whether backward correction actually teaches the hidden layer or whether the output layer merely learns over fixed random features. Across five seeds after 10,000 observations, the full local learner reaches `74.7%` mean one-step accuracy and residual MSE `0.01994`. Freezing all hidden weights and connection biases while continuing to train the output layer reaches only `0.08%` accuracy and MSE `0.03973`; its rollout is effectively persistence (`7.0%`). A longer single-seed frozen run improves slowly to only `27.1%` one-step accuracy after 100,000 observations, compared with roughly `99%` for the full learner. Hidden correction is therefore essential in this experiment.
 
 Run the current Stage 0 implementation with:
 
@@ -270,18 +282,59 @@ Run the current Stage 0 implementation with:
 python -m experiments.moving_dot
 ```
 
-After 10,000 online observations on continuous ten-frame clips of 6×6 bouncing-dot video, the deterministic test run without pruning achieves:
+After 10,000 online observations on continuous ten-frame clips of 6×6 bouncing-dot video, the deterministic PI test run without pruning achieves:
 
-- delta MSE of `0.019713`, compared with `0.055556` for persistence;
-- `71.7%` correct next positions;
-- `15.6%` correct positions over an eight-step autoregressive rollout, compared with `7.0%` for persistence; and
-- `9.1%` of possible edges active on evaluation inputs.
+- delta MSE of `0.018293`, compared with `0.055556` for persistence;
+- `80.1%` correct next positions; and
+- `15.4%` correct positions over an eight-step autoregressive rollout, compared with `7.0%` for persistence.
 
-These are promising first results, not evidence that the method will scale. Rollout accuracy remains low and is the clearest next problem.
+Across five seeds, the same PI configuration reaches `80.0%` mean one-step accuracy, `17.1%` rollout, and `0.018335` MSE. One-step accuracy has a `2.66` percentage-point standard deviation. Restoring independent current-frame and delayed-frame connections therefore recovers the lost early performance. This does not yet isolate PI's contribution on the restored architecture; a new proportional-only control is required.
 
-### Stage 0b: test discontinuous units
+The abandoned all-hidden residual-state experiment and its PI comparison are retained in [Unsuccessful and inconclusive experiments](UNSUCCESSFUL_EXPERIMENTS.md). It was not equivalent to input memory: it forced fixed temporal coefficients after nonlinear transformations and added temporal state to every hidden stage.
 
-Repeat Stage 0 with hard-threshold or spiking neurons while keeping the same active-path correction rule. Compare this directly with the smooth-neuron network. Measure how quickly each one learns, its final error, how often its neurons fire, how expensive each update is, and whether small changes near the firing threshold make training unstable.
+The saved `moving_dot_final_prediction.png` compares a one-step prediction with the real next frame after advancing through eight real frames. Every prediction uses the real current frame and the input delay retains its predecessor; it does not feed predicted pixels back into the model. Autoregressive rollout remains a separate stress test.
+
+The current defaults are weight correction `0.05`, $K_P=0.0015$, $K_I=0.00015$, $\lambda=0.99$, and $I_{\max}=20$. These values are experimental settings, not yet a general rule for choosing PI gains.
+
+A controlled width sweep on the old explicit two-frame baseline shows that the 48-neuron hidden layer was capacity-limited. Across five seeds after 10,000 observations with ten-frame clips:
+
+- 48 hidden neurons: `79.4%` one-step accuracy, `15.8%` rollout accuracy, `0.01839` MSE, and 13,824 learned parameters;
+- 96 hidden neurons: `92.4%`, `18.8%`, `0.01389`, and 27,648 parameters; and
+- 192 hidden neurons: `98.2%`, `21.3%`, `0.01065`, and 55,296 parameters.
+
+Mean training time in this small CPU experiment rises from `1.85` to `2.57` and `4.01` seconds respectively. Width strongly improves one-step learning and reduces variation between seeds, but rollout improves much less. More capacity therefore does not solve error accumulation when predictions are fed back into the model.
+
+The input-to-output shortcut experiment was removed after it traded a large loss in one-step accuracy for a smaller rollout improvement. Its results are preserved in [Unsuccessful and inconclusive experiments](UNSUCCESSFUL_EXPERIMENTS.md).
+
+### Stage 0a: sparse longitudinal broadcasters
+
+Dense output-to-hidden recurrence was removed after failing experimentally; its implementation and results are summarized in [Unsuccessful and inconclusive experiments](UNSUCCESSFUL_EXPERIMENTS.md). It should not be confused with sparse longitudinal connectivity.
+
+A different hypothesis is to give a small fraction of neurons very high feed-forward fanout. Most neurons retain sparse local connections, while these broadcaster neurons project across several later layers. Start with many random longitudinal edges, collect local correction and activity evidence, then rapidly deactivate and physically prune paths that are unused or harmful.
+
+This needs a network with at least three hidden layers: in the current one-hidden-layer model, every hidden neuron already connects directly to the output, so “longitudinal” fanout is not a distinct architecture. Compare broadcasters against a control with the same total edge and parameter budget. Otherwise any improvement could come merely from adding connections rather than concentrating them in a few long-range paths.
+
+The first controlled test used the old explicit two-frame input with three 48-neuron hidden layers. Four first-layer broadcasters owned 480 dense long edges to the third hidden layer and output. The equal-budget control distributed exactly 480 long edges randomly across all 48 first-layer neurons. Across five seeds after 10,000 observations:
+
+- adjacent layers alone reach `2.0%` one-step accuracy and `6.9%` rollout;
+- uniformly distributed long edges reach `39.8%` and `10.5%`;
+- four concentrated broadcasters reach only `5.5%` and `6.5%`; and
+- pruning broadcaster edges every 250 observations leaves 207 of 480 edges on average and reaches `4.5%` and `6.5%`.
+
+Long paths clearly help correction cross the three-layer model, but concentrating the same budget in four neurons creates too narrow a representational bottleneck. Rapid inactivity pruning compresses the broadcaster path by `57%` without causing the failure, but it does not rescue it. The more important result is that the adjacent-only deep learner barely trains: the current unsigned mean-correction rule does not yet assign useful credit through three layers. Detailed negative results are retained in [Unsuccessful and inconclusive experiments](UNSUCCESSFUL_EXPERIMENTS.md).
+
+The deep implementation now uses the same one-frame input delay while keeping all three hidden stages stateless. In an initial single-seed 10,000-observation check, adjacent layers alone remain at persistence (`0%` correct next positions), while four broadcasters reach `17.4%`. This is still weak and needs a new controlled multi-seed comparison.
+
+### Stage 0b: increase structural complexity
+
+Before real grayscale video, move beyond one-hot input in controlled steps:
+
+1. predict a translating and bouncing multi-pixel T shape;
+2. predict two, five, and then ten independently moving dots, explicitly measuring failures at overlaps and collisions;
+3. replace the single hidden layer with at least three hidden layers; and
+4. rerun inactive-edge pruning and neuron-level merging as width and depth create more opportunities for redundancy.
+
+These tests preserve known dynamics while adding simultaneous active pixels, ambiguous overlaps, deeper credit assignment, and enough excess capacity for structural merging to become measurable.
 
 ### Stage 1: controlled visual dynamics
 
@@ -345,3 +398,4 @@ The first version does not need to match backpropagation. Showing that local fee
 15. Neftci, E. O., Mostafa, H. & Zenke, F. (2019). [*Surrogate Gradient Learning in Spiking Neural Networks*](https://arxiv.org/abs/1901.09948).
 16. Ba, J. L. et al. (2016). [*Using Fast Weights to Attend to the Recent Past*](https://papers.nips.cc/paper/2016/hash/9f44e956e3a2b7b5598c625fcc802c36-Abstract.html).
 17. Miconi, T., Stanley, K. & Clune, J. (2018). [*Differentiable Plasticity: Training Plastic Neural Networks with Backpropagation*](https://proceedings.mlr.press/v80/miconi18a.html).
+18. Foster, D. J. & Wilson, M. A. (2006). [*Reverse Replay of Behavioural Sequences in Hippocampal Place Cells During the Awake State*](https://doi.org/10.1038/nature04587).
