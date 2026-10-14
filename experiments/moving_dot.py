@@ -90,6 +90,7 @@ class VideoRecord:
     hidden_edge_active: Tensor
     hidden_active: Tensor
     output_edge_active: Tensor
+    output_edge_contribution: Tensor
     output_active: Tensor
 
 
@@ -203,6 +204,7 @@ class MovingDotPredictor:
         )
         self.previous_frame = current_input.clone()
         output, output_edge_active = self.output_layer.forward(hidden)
+        output_edge_contribution = self.output_layer.edge_contribution(hidden)
 
         positive_delta = output[: self.pixel_count]
         negative_delta = output[self.pixel_count :]
@@ -218,6 +220,7 @@ class MovingDotPredictor:
             hidden_edge_active=hidden_edge_active,
             hidden_active=hidden > 0,
             output_edge_active=output_edge_active,
+            output_edge_contribution=output_edge_contribution,
             output_active=output > 0,
         )
 
@@ -246,8 +249,6 @@ class MovingDotPredictor:
         ).clamp(min=0.0)
         pixel_reward = meaningful_change * low_error_reward
 
-        # Raising the positive channel or lowering the negative channel both
-        # increase the signed prediction.
         output_correction = torch.cat([error, -error])
         output_correction *= record.output_active
         output_reward = torch.cat([pixel_reward, pixel_reward])
@@ -282,26 +283,27 @@ class MovingDotPredictor:
 
         # Every hidden neuron receives the mean correction from the output
         # connections that were active during this prediction.
-        active_output_count = torch.zeros(
-            self.hidden_size,
-            dtype=torch.int64,
-        )
-        active_output_count.scatter_add_(
+        outgoing_activity = torch.zeros(self.hidden_size)
+        outgoing_activity.scatter_add_(
             0,
             output_sources,
-            record.output_edge_active.to(torch.int64),
+            record.output_edge_contribution,
         )
         hidden_correction = torch.zeros(self.hidden_size)
         hidden_correction.scatter_add_(
             0,
             output_sources,
-            output_edge_correction,
+            output_edge_correction * record.output_edge_contribution,
         )
-        hidden_correction /= active_output_count.clamp_min(1)
+        hidden_correction /= outgoing_activity.clamp_min(1e-12)
         hidden_correction *= record.hidden_active
         hidden_reward = torch.zeros(self.hidden_size)
-        hidden_reward.scatter_add_(0, output_sources, output_edge_reward)
-        hidden_reward /= active_output_count.clamp_min(1)
+        hidden_reward.scatter_add_(
+            0,
+            output_sources,
+            output_edge_reward * record.output_edge_contribution,
+        )
+        hidden_reward /= outgoing_activity.clamp_min(1e-12)
         hidden_reward *= record.hidden_active
 
         hidden_targets = self.hidden_layer.target_index
@@ -1276,7 +1278,7 @@ def save_prediction_animation(
     model: MovingDotPredictor,
     *,
     output_path: str = "moving_dot_prediction.gif",
-    seed: int = 20_003,
+    seed: int = 20_0013,
     frame_count: int = 32,
     frames_per_second: int = 2,
 ) -> str:
@@ -1534,7 +1536,7 @@ def run_online_experiment(
 
 def main() -> None:
     parser = ArgumentParser()
-    parser.add_argument("--observations", type=int, default=100_000)
+    parser.add_argument("--observations", type=int, default=10_000)
     parser.add_argument("--hidden-size", type=int, default=48)
     parser.add_argument("--pruning-interval", type=int, default=1_000)
     parser.add_argument("--merge-redundant-neurons", action="store_true")

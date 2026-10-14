@@ -46,12 +46,16 @@ class SparseConnectionLayer:
     def possible_edge_count(self) -> int:
         return self.source_count * self.target_count
 
-    def forward(self, source: Tensor) -> tuple[Tensor, Tensor]:
+    def edge_contribution(self, source: Tensor) -> Tensor:
+        """Return each edge's recorded nonnegative forward contribution."""
         pre_activation = (
             source[self.source_index] * self.weight - self.bias
         )
-        active = pre_activation > 0
-        contribution = torch.relu(pre_activation)
+        return torch.relu(pre_activation)
+
+    def forward(self, source: Tensor) -> tuple[Tensor, Tensor]:
+        contribution = self.edge_contribution(source)
+        active = contribution > 0
         target = torch.zeros(
             self.target_count,
             dtype=source.dtype,

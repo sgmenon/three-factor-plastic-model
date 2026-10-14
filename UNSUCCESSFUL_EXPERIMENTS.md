@@ -35,6 +35,26 @@ With PI correction, the one-hidden-layer model reached `54.1%` one-step accuracy
 
 The all-hidden residual mechanism was removed. Ordinary hidden neurons are now stateless, while current and delayed frames have independent first-layer connections. Stateful NMDA-inspired memory neurons remain a separate future experiment rather than an implicit property of every hidden neuron.
 
+## Separate positive and negative output targets
+
+The signed frame delta is represented as the difference of two nonnegative output channels. Inspection of a visible ghost prediction found large values in both channels: at one false pixel, the positive channel produced `0.522`, the negative channel produced `0.304`, and their imperfect cancellation left a visible prediction of `0.218`.
+
+Training each channel directly toward
+
+$$
+y^+=\max(\Delta x,0), \qquad y^-=\max(-\Delta x,0)
+$$
+
+removed that ambiguity but collapsed learning. After 10,000 observations, one-step accuracy fell from `80.1%` to `0.6%`, MSE rose from `0.01829` to `0.03344`, and rollout fell below persistence. Using separate targets only for the output layer while retaining signed-error feedback for the hidden layer recovered just `15.4%` one-step accuracy. The 70 mostly-zero output targets overwhelmed the two moving-pixel targets and suppressed useful output activity.
+
+A weaker common-mode penalty,
+
+$$
+c_{\mathrm{out}}=[e,-e]-\lambda[y^+,y^-],
+$$
+
+was also tested. At $\lambda=0.003$, it reduced the inspected ghost from `0.218` to `0.158`. Across five seeds, mean one-step accuracy increased from `80.0%` to `81.3%` and MSE improved slightly from `0.018335` to `0.018281`, but rollout fell from `17.1%` to `15.5%`. This was not a clear overall improvement, so the optional mechanism was removed from the active code.
+
 ## Hard-step connections
 
 A discontinuous connection was tested as
@@ -129,7 +149,23 @@ A three-hidden-layer model tested whether a small population with high feed-forw
 
 Across five seeds after 10,000 observations, the adjacent-only model reached `2.0%` one-step accuracy, uniformly distributed long edges reached `39.8%`, and concentrated broadcasters reached only `5.5%`. Their eight-step rollout scores were `6.9%`, `10.5%`, and `6.5%`. Pruning broadcaster edges every 250 observations retained 207 of 480 edges on average but reduced one-step accuracy to `4.5%`.
 
-Long-range paths help this deep local learner, but concentrating them in four neurons is much worse than spreading the same edge budget. Four random features cannot carry enough position-specific information for the moving-dot task. The adjacent-only failure also shows that the current mean active-path correction does not assign useful credit through three hidden layers. The implementation remains available as an ablation, but concentrated broadcasters are not part of the active proposal.
+Long-range paths help this deep local learner, but concentrating them in four neurons is much worse than spreading the same edge budget. Four random features cannot carry enough position-specific information for the moving-dot task. The adjacent-only failure also shows that the mean active-path correction does not assign useful credit through three hidden layers. The broadcaster implementation was removed from the cleaned deep experiment.
+
+## Active-fan-in normalization and hidden homeostasis
+
+An intermediate deep model divided each neuron output by its currently active
+fan-in and adjusted every hidden connection bias toward `10%` conditional
+activity. Fan-in normalization fixed the immediate scale explosion: initial
+hidden means stayed near `0.120`, `0.126`, and `0.132`, and initial MSE fell
+from `4.93` under identical unnormalized parameters to `0.0556`.
+
+The homeostatic target then compounded through depth. After 10,000
+observations, edge activity fell to `0.3%`, `0%`, and `0%` across the hidden
+stack, hidden means approached zero, and accuracy remained `0%`. Keeping a
+fixed fraction of available signals independently at every layer behaves
+roughly like multiplying that fraction through the path. Both active-fan-in
+normalization and this homeostatic rule were removed rather than mixed into
+the tied-reverse experiment.
 
 ## Apparent convergence gain from shuffled transitions
 
