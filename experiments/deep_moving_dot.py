@@ -1,22 +1,23 @@
 """Configurable deep moving-dot experiment with active-path reverse targets.
 
-The forward graph contains only adjacent positive connection layers. Hidden
-layer one carries a temporal residual; later hidden layers are stateless.
+The forward graph contains only adjacent connection layers. Hidden layer one
+carries a temporal residual; later hidden layers are stateless. A configurable
+minority of hidden neurons can have fixed inhibitory outgoing signs.
 Learning uses no autograd:
 
 1. update the output from the externally measured pixel error;
 2. allocate that correction directly to the final hidden layer;
 3. invert through updated active connections only for earlier hidden layers.
 
-Within each neuron, active incoming connections accumulate local feedback.
-Positive connections receive an extra bias reward. Of the currently negative
-connections, all but the least-bad N receive a stronger bias penalty.
+Each active connection receives ordinary local PI bias correction. Structural
+Gaussian locality replaces the removed ranked negative-feedback competition.
 """
 
 from __future__ import annotations
 
 from argparse import ArgumentParser
 from dataclasses import dataclass
+from math import ceil
 from time import perf_counter
 
 import torch
@@ -45,6 +46,20 @@ class DeepVideoRecord:
     edge_contribution: tuple[Tensor, ...]
 
 
+@dataclass(frozen=True)
+class NeuronClassConnectivity:
+    layer: int
+    inhibitory_neurons: int
+    excitatory_neurons: int
+    inhibitory_mean_fan_in: float
+    excitatory_mean_fan_in: float
+    inhibitory_mean_fan_out: float
+    excitatory_mean_fan_out: float
+    top_inhibitory_neuron: int | None
+    top_inhibitory_fan_in: int
+    top_inhibitory_fan_out: int
+
+
 class DeepMovingDotPredictor:
     """Symmetric hidden stack trained by tied reverse target generation."""
 
@@ -61,11 +76,10 @@ class DeepMovingDotPredictor:
         bias_integral_gain: float = 1.5e-4,
         bias_integral_decay: float = 0.99,
         bias_integral_limit: float = 20.0,
-        competition_proportional_gain: float = 5e-2,
-        competition_integral_gain: float = 5e-3,
-        competition_integral_decay: float = 1.0,
-        severe_penalty_multiplier: float = 4.0,
-        negative_tolerance: int = 10,
+        inhibitory_fraction: float = 0.0,
+        local_connectivity_fraction: float | None = None,
+        local_connectivity_sigma: float | None = None,
+        local_connectivity_scope: str = "all",
         minimum_weight: float = 1e-4,
         update_hidden: bool = True,
     ) -> None:
@@ -79,13 +93,24 @@ class DeepMovingDotPredictor:
             )
         if temporal_residual_gain <= 0:
             raise ValueError("Temporal residual gain must be positive")
-        if negative_tolerance < 0:
-            raise ValueError("Negative tolerance cannot be negative")
-        if not 0 <= competition_integral_decay <= 1:
+        if not 0 <= inhibitory_fraction < 1:
+            raise ValueError("Inhibitory fraction must be in [0, 1)")
+        if (
+            local_connectivity_fraction is not None
+            and not 0 < local_connectivity_fraction <= 1
+        ):
             raise ValueError(
-                "Competition integral decay must be between zero and one"
+                "Local connectivity fraction must be in (0, 1]"
             )
-
+        if (
+            local_connectivity_sigma is not None
+            and local_connectivity_sigma <= 0
+        ):
+            raise ValueError("Local connectivity sigma must be positive")
+        if local_connectivity_scope not in {"all", "hidden"}:
+            raise ValueError(
+                "Local connectivity scope must be 'all' or 'hidden'"
+            )
         generator = torch.Generator().manual_seed(seed)
         self.grid_size = grid_size
         self.pixel_count = grid_size * grid_size
@@ -100,13 +125,14 @@ class DeepMovingDotPredictor:
         self.bias_integral_gain = bias_integral_gain
         self.bias_integral_decay = bias_integral_decay
         self.bias_integral_limit = bias_integral_limit
-        self.competition_proportional_gain = (
-            competition_proportional_gain
+        self.inhibitory_fraction = inhibitory_fraction
+        self.local_connectivity_fraction = local_connectivity_fraction
+        self.local_connectivity_sigma = (
+            local_connectivity_fraction
+            if local_connectivity_sigma is None
+            else local_connectivity_sigma
         )
-        self.competition_integral_gain = competition_integral_gain
-        self.competition_integral_decay = competition_integral_decay
-        self.severe_penalty_multiplier = severe_penalty_multiplier
-        self.negative_tolerance = negative_tolerance
+        self.local_connectivity_scope = local_connectivity_scope
         self.minimum_weight = minimum_weight
         self.update_hidden = update_hidden
 
@@ -146,6 +172,65 @@ class DeepMovingDotPredictor:
                 bias_high=0.014,
             )
         )
+        if local_connectivity_fraction is not None:
+            topology_generator = torch.Generator().manual_seed(
+                seed + 2_000_003
+            )
+            for layer_index, layer in enumerate(self.layers):
+                if (
+                    local_connectivity_scope == "hidden"
+                    and (
+                        layer_index == 0
+                        or layer_index == self.output_layer_index
+                    )
+                ):
+                    continue
+                layer.filter_edges(
+                    self._local_connection_mask(
+                        layer_index,
+                        local_connectivity_fraction,
+                        self.local_connectivity_sigma,
+                        topology_generator,
+                    )
+                )
+
+        type_generator = torch.Generator().manual_seed(seed + 1_000_003)
+        hidden_target_sizes = [
+            self.first_raw_size,
+            *([hidden_size] * (hidden_layer_count - 1)),
+        ]
+        inhibitory_masks: list[Tensor] = []
+        for neuron_count in hidden_target_sizes:
+            inhibitory_count = round(inhibitory_fraction * neuron_count)
+            mask = torch.zeros(neuron_count, dtype=torch.bool)
+            if inhibitory_count:
+                selected = torch.randperm(
+                    neuron_count,
+                    generator=type_generator,
+                )[:inhibitory_count]
+                mask[selected] = True
+            inhibitory_masks.append(mask)
+        self.hidden_inhibitory = tuple(inhibitory_masks)
+        self.hidden_output_sign = (
+            torch.cat(
+                [
+                    torch.where(
+                        self.hidden_inhibitory[0],
+                        -torch.ones(self.first_raw_size),
+                        torch.ones(self.first_raw_size),
+                    ),
+                ]
+                * 2
+            ),
+            *(
+                torch.where(
+                    mask,
+                    -torch.ones(mask.numel()),
+                    torch.ones(mask.numel()),
+                )
+                for mask in self.hidden_inhibitory[1:]
+            ),
+        )
 
         controller_arguments = {
             "proportional_gain": bias_proportional_gain,
@@ -157,31 +242,134 @@ class DeepMovingDotPredictor:
             PICorrection(layer.edge_count, **controller_arguments)
             for layer in self.layers
         ]
-        self.competition_integral = [
-            torch.zeros(layer.edge_count) for layer in self.layers
-        ]
         self.activity_counts = [
             torch.zeros(layer.edge_count, dtype=torch.int64)
             for layer in self.layers
         ]
         self.activity_observations = 0
         self.total_pruned = 0
-        self.total_severely_penalized = 0
-        self.last_severely_penalized = tuple(
-            0 for _ in self.layers
-        )
         self.previous_first_raw = torch.zeros(self.first_raw_size)
 
     @property
     def output_layer_index(self) -> int:
         return len(self.layers) - 1
 
+    def _local_connection_mask(
+        self,
+        layer_index: int,
+        fraction: float,
+        sigma: float,
+        generator: torch.Generator,
+    ) -> Tensor:
+        """Sample a fixed edge budget around proportional Gaussian centers."""
+        layer = self.layers[layer_index]
+        pair_mask = torch.zeros(
+            layer.target_count,
+            layer.source_count,
+            dtype=torch.bool,
+        )
+        if layer_index == 1:
+            source_position = (
+                torch.arange(layer.source_count) % self.first_raw_size
+            )
+            source_position = (
+                source_position.to(torch.float32) + 0.5
+            ) / self.first_raw_size
+        else:
+            source_position = (
+                torch.arange(layer.source_count, dtype=torch.float32) + 0.5
+            ) / layer.source_count
+
+        if layer_index == self.output_layer_index:
+            group_size = self.pixel_count
+            total_neighbors = max(
+                1,
+                ceil(fraction * layer.target_count),
+            )
+            first_group = (total_neighbors + 1) // 2
+            neighbors_per_group = [first_group, total_neighbors - first_group]
+            target_position = (
+                torch.arange(group_size, dtype=torch.float32) + 0.5
+            ) / group_size
+            for source in range(layer.source_count):
+                distance = (target_position - source_position[source]).abs()
+                probability = torch.exp(
+                    -(distance.square()) / (2 * sigma**2)
+                )
+                for group, neighbor_count in enumerate(
+                    neighbors_per_group
+                ):
+                    if neighbor_count == 0:
+                        continue
+                    selected = torch.multinomial(
+                        probability,
+                        min(neighbor_count, group_size),
+                        replacement=False,
+                        generator=generator,
+                    )
+                    pair_mask[
+                        group * group_size + selected,
+                        source,
+                    ] = True
+        else:
+            neighbor_count = max(
+                1,
+                ceil(fraction * layer.target_count),
+            )
+            target_position = (
+                torch.arange(
+                    layer.target_count,
+                    dtype=torch.float32,
+                )
+                + 0.5
+            ) / layer.target_count
+            for source in range(layer.source_count):
+                distance = (target_position - source_position[source]).abs()
+                probability = torch.exp(
+                    -(distance.square()) / (2 * sigma**2)
+                )
+                selected = torch.multinomial(
+                    probability,
+                    min(neighbor_count, layer.target_count),
+                    replacement=False,
+                    generator=generator,
+                )
+                pair_mask[selected, source] = True
+        return pair_mask[layer.target_index, layer.source_index]
+
     def reset_state(self) -> None:
         self.previous_first_raw = torch.zeros(self.first_raw_size)
 
+    def _edge_sign(self, layer_index: int) -> Tensor:
+        layer = self.layers[layer_index]
+        if layer_index == 0:
+            return torch.ones(layer.edge_count)
+        return self.hidden_output_sign[layer_index - 1][
+            layer.source_index
+        ]
+
+    def _forward_layer(
+        self,
+        layer_index: int,
+        source: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        layer = self.layers[layer_index]
+        contribution = layer.edge_contribution(source)
+        target = torch.zeros(
+            layer.target_count,
+            dtype=source.dtype,
+            device=source.device,
+        )
+        target.scatter_add_(
+            0,
+            layer.target_index,
+            self._edge_sign(layer_index) * contribution,
+        )
+        return torch.relu(target), contribution > 0, contribution
+
     def prime_state(self, first_frame: Tensor) -> None:
         self.reset_state()
-        raw, _ = self.layers[0].forward(first_frame.flatten())
+        raw, _, _ = self._forward_layer(0, first_frame.flatten())
         self.previous_first_raw = raw.clone()
 
     def forward(self, current_frame: Tensor) -> DeepVideoRecord:
@@ -193,9 +381,8 @@ class DeepMovingDotPredictor:
         edge_active: list[Tensor] = []
         edge_contribution: list[Tensor] = []
 
-        for index, layer in enumerate(self.layers[:-1]):
-            raw, active = layer.forward(source)
-            contribution = layer.edge_contribution(source)
+        for index, _layer in enumerate(self.layers[:-1]):
+            raw, active, contribution = self._forward_layer(index, source)
             raw_hidden.append(raw)
             edge_active.append(active)
             edge_contribution.append(contribution)
@@ -215,9 +402,10 @@ class DeepMovingDotPredictor:
             hidden.append(state)
             source = state
 
-        output_layer = self.layers[-1]
-        output, output_active = output_layer.forward(source)
-        output_contribution = output_layer.edge_contribution(source)
+        output, output_active, output_contribution = self._forward_layer(
+            self.output_layer_index,
+            source,
+        )
         edge_active.append(output_active)
         edge_contribution.append(output_contribution)
         predicted_delta = (
@@ -283,9 +471,28 @@ class DeepMovingDotPredictor:
             invertible_contribution
             / target_contribution[layer.target_index].clamp_min(1e-12)
         )
-        desired_edge_contribution = (
-            allocation * desired_target[layer.target_index]
+        edge_sign = self._edge_sign(layer_index)
+        current_target = torch.zeros_like(desired_target)
+        current_target.scatter_add_(
+            0,
+            layer.target_index,
+            edge_sign * invertible_contribution,
         )
+        current_target.relu_()
+        target_delta = desired_target - current_target
+        if torch.all(edge_sign > 0):
+            # Preserve the original positive-only calculation exactly.
+            desired_edge_contribution = (
+                allocation * desired_target[layer.target_index]
+            )
+        else:
+            desired_edge_contribution = (
+                invertible_contribution
+                + edge_sign
+                * allocation
+                * target_delta[layer.target_index]
+            )
+            desired_edge_contribution.clamp_(min=0.0)
         source_request = torch.zeros_like(recorded_contribution)
         source_request[invertible] = (
             desired_edge_contribution[invertible] + layer.bias[invertible]
@@ -311,64 +518,6 @@ class DeepMovingDotPredictor:
             desired_source_sum
             / desired_source_weight.clamp_min(1e-12)
         )
-
-    def _competition_pi(
-        self,
-        layer_index: int,
-        current_feedback: Tensor,
-    ) -> Tensor:
-        active_feedback = current_feedback != 0
-        accumulated = (
-            self.competition_integral_decay
-            * self.competition_integral[layer_index]
-            + current_feedback
-        )
-        self.competition_integral[layer_index] = torch.where(
-            active_feedback,
-            accumulated,
-            self.competition_integral[layer_index],
-        )
-        pi_value = (
-            self.competition_proportional_gain * current_feedback
-            + self.competition_integral_gain
-            * self.competition_integral[layer_index]
-        )
-        return torch.where(
-            active_feedback,
-            pi_value,
-            torch.zeros_like(pi_value),
-        )
-
-    def _competition_bias_adjustment(
-        self,
-        layer_index: int,
-        current_feedback: Tensor,
-        pi_feedback: Tensor,
-    ) -> tuple[Tensor, int]:
-        """Return an additive bias adjustment and severe-penalty count."""
-        layer = self.layers[layer_index]
-        adjustment = torch.zeros_like(current_feedback)
-        positive = current_feedback > 0
-        adjustment[positive] = -pi_feedback[positive].abs()
-
-        severely_penalized = 0
-        for target in range(layer.target_count):
-            negative = torch.nonzero(
-                (layer.target_index == target) & (current_feedback < 0),
-                as_tuple=False,
-            ).flatten()
-            excess = negative.numel() - self.negative_tolerance
-            if excess <= 0:
-                continue
-            order = torch.argsort(pi_feedback[negative])
-            worst = negative[order[:excess]]
-            effective = worst[pi_feedback[worst] != 0]
-            adjustment[effective] = (
-                self.severe_penalty_multiplier
-                * pi_feedback[effective].abs()
-            )
-            severely_penalized += effective.numel()
-        return adjustment, severely_penalized
 
     def _recorded_source(
         self,
@@ -408,33 +557,19 @@ class DeepMovingDotPredictor:
         source: Tensor,
         target_correction: Tensor,
         recorded_active: Tensor,
-        recorded_contribution: Tensor,
-    ) -> int:
+    ) -> None:
         layer = self.layers[layer_index]
+        edge_sign = self._edge_sign(layer_index)
         edge_correction = (
-            target_correction[layer.target_index] * recorded_active
+            edge_sign
+            * target_correction[layer.target_index]
+            * recorded_active
         )
         ordinary_bias_update = self.bias_controllers[layer_index].update(
             edge_correction
         )
-        current_feedback = (
-            target_correction[layer.target_index]
-            * recorded_contribution
-        )
-        pi_feedback = self._competition_pi(
-            layer_index,
-            current_feedback,
-        )
-        competition_adjustment, penalized = (
-            self._competition_bias_adjustment(
-                layer_index,
-                current_feedback,
-                pi_feedback,
-            )
-        )
 
         layer.bias.sub_(ordinary_bias_update)
-        layer.bias.add_(competition_adjustment)
         layer.bias.clamp_(min=0.0)
 
         final_active = (
@@ -442,11 +577,11 @@ class DeepMovingDotPredictor:
         ) & recorded_active
         layer.weight.add_(
             self.weight_learning_rate
+            * edge_sign
             * target_correction[layer.target_index]
             * source[layer.source_index]
             * final_active
         )
-        return penalized
 
     def correct(
         self,
@@ -456,22 +591,20 @@ class DeepMovingDotPredictor:
         """Use direct output error, then invert only between hidden layers."""
         flat_target = target_delta.flatten()
         error = flat_target - record.predicted_delta.flatten()
-        penalized_by_layer = [0 for _ in self.layers]
 
         output_correction = torch.cat([error, -error])
-        output_correction *= record.output > 0
         output_index = self.output_layer_index
-        penalized_by_layer[output_index] = self._update_layer(
+        self._update_layer(
             output_index,
             record.hidden[-1],
             output_correction,
             record.edge_active[output_index],
-            record.edge_contribution[output_index],
         )
 
         output_layer = self.layers[output_index]
         output_edge_correction = (
             output_correction[output_layer.target_index]
+            * self._edge_sign(output_index)
             * record.edge_active[output_index]
         )
         hidden_correction_sum = torch.zeros(self.hidden_size)
@@ -509,12 +642,11 @@ class DeepMovingDotPredictor:
             target_correction = desired_for_update - recorded_target
 
             if self.update_hidden:
-                penalized_by_layer[layer_index] = self._update_layer(
+                self._update_layer(
                     layer_index,
                     self._recorded_source(record, layer_index),
                     target_correction,
                     record.edge_active[layer_index],
-                    record.edge_contribution[layer_index],
                 )
 
             if layer_index > 0:
@@ -527,8 +659,6 @@ class DeepMovingDotPredictor:
         for index, active in enumerate(record.edge_active):
             self.activity_counts[index] += active.to(torch.int64)
         self.activity_observations += 1
-        self.last_severely_penalized = tuple(penalized_by_layer)
-        self.total_severely_penalized += sum(penalized_by_layer)
         return error.square().mean()
 
     def prune_inactive(
@@ -554,9 +684,6 @@ class DeepMovingDotPredictor:
             pruned += int((~keep).sum().item())
             layer.filter_edges(keep)
             self.bias_controllers[index].filter_connections(keep)
-            self.competition_integral[index] = (
-                self.competition_integral[index][keep]
-            )
             self.activity_counts[index] = torch.zeros(
                 layer.edge_count,
                 dtype=torch.int64,
@@ -572,7 +699,77 @@ class DeepMovingDotPredictor:
         return 2 * self.present_connection_count()
 
     def training_state_count(self) -> int:
-        return 2 * self.present_connection_count()
+        return self.present_connection_count()
+
+    def neuron_class_connectivity(
+        self,
+    ) -> tuple[NeuronClassConnectivity, ...]:
+        """Summarize post-pruning fan-in and fan-out by hidden neuron type."""
+        summaries: list[NeuronClassConnectivity] = []
+        for layer_index, inhibitory in enumerate(self.hidden_inhibitory):
+            neuron_count = inhibitory.numel()
+            incoming = torch.bincount(
+                self.layers[layer_index].target_index,
+                minlength=neuron_count,
+            )
+            outgoing_source = self.layers[layer_index + 1].source_index
+            if layer_index == 0:
+                outgoing_source = outgoing_source % self.first_raw_size
+            outgoing = torch.bincount(
+                outgoing_source,
+                minlength=neuron_count,
+            )
+            excitatory = ~inhibitory
+
+            def mean_for(values: Tensor, mask: Tensor) -> float:
+                if not torch.any(mask):
+                    return 0.0
+                return values[mask].to(torch.float32).mean().item()
+
+            inhibitory_indices = torch.nonzero(
+                inhibitory,
+                as_tuple=False,
+            ).flatten()
+            if inhibitory_indices.numel():
+                total_connectivity = incoming + outgoing
+                top_offset = torch.argmax(
+                    total_connectivity[inhibitory_indices]
+                )
+                top = int(inhibitory_indices[top_offset].item())
+                top_fan_in = int(incoming[top].item())
+                top_fan_out = int(outgoing[top].item())
+            else:
+                top = None
+                top_fan_in = 0
+                top_fan_out = 0
+
+            summaries.append(
+                NeuronClassConnectivity(
+                    layer=layer_index + 1,
+                    inhibitory_neurons=int(inhibitory.sum().item()),
+                    excitatory_neurons=int(excitatory.sum().item()),
+                    inhibitory_mean_fan_in=mean_for(
+                        incoming,
+                        inhibitory,
+                    ),
+                    excitatory_mean_fan_in=mean_for(
+                        incoming,
+                        excitatory,
+                    ),
+                    inhibitory_mean_fan_out=mean_for(
+                        outgoing,
+                        inhibitory,
+                    ),
+                    excitatory_mean_fan_out=mean_for(
+                        outgoing,
+                        excitatory,
+                    ),
+                    top_inhibitory_neuron=top,
+                    top_inhibitory_fan_in=top_fan_in,
+                    top_inhibitory_fan_out=top_fan_out,
+                )
+            )
+        return tuple(summaries)
 
     def predict_next(self, current_frame: Tensor) -> Tensor:
         delta = self.forward(current_frame).predicted_delta
@@ -667,10 +864,10 @@ def run_online_experiment(
     observations: int = 10_000,
     hidden_size: int = 96,
     hidden_layer_count: int = 2,
-    negative_tolerance: int = 10,
-    competition_proportional_gain: float = 5e-2,
-    competition_integral_gain: float = 5e-3,
-    severe_penalty_multiplier: float = 4.0,
+    inhibitory_fraction: float = 0.0,
+    local_connectivity_fraction: float | None = None,
+    local_connectivity_sigma: float | None = None,
+    local_connectivity_scope: str = "all",
     update_hidden: bool = True,
     pruning_interval: int | None = None,
     minimum_activity_rate: float = 0.001,
@@ -687,10 +884,10 @@ def run_online_experiment(
         hidden_size=hidden_size,
         hidden_layer_count=hidden_layer_count,
         seed=seed,
-        negative_tolerance=negative_tolerance,
-        competition_proportional_gain=competition_proportional_gain,
-        competition_integral_gain=competition_integral_gain,
-        severe_penalty_multiplier=severe_penalty_multiplier,
+        inhibitory_fraction=inhibitory_fraction,
+        local_connectivity_fraction=local_connectivity_fraction,
+        local_connectivity_sigma=local_connectivity_sigma,
+        local_connectivity_scope=local_connectivity_scope,
         minimum_weight=minimum_weight,
         update_hidden=update_hidden,
     )
@@ -748,13 +945,18 @@ def main() -> None:
     parser.add_argument("--observations", type=int, default=10_000)
     parser.add_argument("--hidden-size", type=int, default=96)
     parser.add_argument("--hidden-layers", type=int, default=2)
-    parser.add_argument("--negative-tolerance", type=int, default=10)
-    parser.add_argument("--competition-kp", type=float, default=5e-2)
-    parser.add_argument("--competition-ki", type=float, default=5e-3)
-    parser.add_argument("--severe-multiplier", type=float, default=4.0)
+    parser.add_argument("--inhibitory-fraction", type=float, default=0.06)
+    parser.add_argument("--local-connectivity", type=float, default=None)
+    parser.add_argument("--local-connectivity-sigma", type=float, default=None)
+    parser.add_argument(
+        "--local-connectivity-scope",
+        choices=["all", "hidden"],
+        default="all",
+    )
     parser.add_argument("--pruning-interval", type=int, default=1000)
+    parser.add_argument("--no-pruning", action="store_true")
     parser.add_argument("--minimum-activity-rate", type=float, default=0.001)
-    parser.add_argument("--minimum-weight", type=float, default=1e-4)
+    parser.add_argument("--minimum-weight", type=float, default=1e-3)
     parser.add_argument("--freeze-hidden", action="store_true")
     args = parser.parse_args()
 
@@ -763,12 +965,14 @@ def main() -> None:
         observations=args.observations,
         hidden_size=args.hidden_size,
         hidden_layer_count=args.hidden_layers,
-        negative_tolerance=args.negative_tolerance,
-        competition_proportional_gain=args.competition_kp,
-        competition_integral_gain=args.competition_ki,
-        severe_penalty_multiplier=args.severe_multiplier,
+        inhibitory_fraction=args.inhibitory_fraction,
+        local_connectivity_fraction=args.local_connectivity,
+        local_connectivity_sigma=args.local_connectivity_sigma,
+        local_connectivity_scope=args.local_connectivity_scope,
         update_hidden=not args.freeze_hidden,
-        pruning_interval=args.pruning_interval,
+        pruning_interval=(
+            None if args.no_pruning else args.pruning_interval
+        ),
         minimum_activity_rate=args.minimum_activity_rate,
         minimum_weight=args.minimum_weight,
     )
@@ -777,6 +981,19 @@ def main() -> None:
     rollout = rollout_position_accuracy(model)
     active_fractions = evaluation_active_edge_fractions(model)
     print(f"Hidden layers:         {model.hidden_layer_count}")
+    print(f"Inhibitory fraction:   {model.inhibitory_fraction:.1%}")
+    print(
+        "Initial topology:      "
+        + (
+            "dense"
+            if model.local_connectivity_fraction is None
+            else (
+                f"{model.local_connectivity_fraction:.1%} Gaussian "
+                f"(sigma={model.local_connectivity_sigma:.3f}, "
+                f"scope={model.local_connectivity_scope})"
+            )
+        )
+    )
     print(f"Hidden updates:        {model.update_hidden}")
     print(f"Autograd used:         no")
     print(f"Final MSE:             {mse:.6f}")
@@ -787,12 +1004,24 @@ def main() -> None:
     print(f"Connections pruned:    {model.total_pruned}")
     print(f"Learned parameters:    {model.learned_parameter_count()}")
     print(f"PI training state:     {model.training_state_count()}")
-    print(f"Severe penalties:      {model.total_severely_penalized}")
     print(f"Training seconds:      {elapsed:.2f}")
     print(
         "Active edge fractions: "
         + ", ".join(f"{fraction:.1%}" for fraction in active_fractions)
     )
+    for summary in model.neuron_class_connectivity():
+        print(
+            f"Hidden {summary.layer} connectivity: "
+            f"I={summary.inhibitory_neurons} "
+            f"(in={summary.inhibitory_mean_fan_in:.1f}, "
+            f"out={summary.inhibitory_mean_fan_out:.1f}), "
+            f"E={summary.excitatory_neurons} "
+            f"(in={summary.excitatory_mean_fan_in:.1f}, "
+            f"out={summary.excitatory_mean_fan_out:.1f}), "
+            f"top I={summary.top_inhibitory_neuron} "
+            f"(in={summary.top_inhibitory_fan_in}, "
+            f"out={summary.top_inhibitory_fan_out})"
+        )
     print("Progress every 2,000 observations:")
     for observation, checkpoint_mse, checkpoint_accuracy, connections, pruned in history:
         print(

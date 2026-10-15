@@ -82,35 +82,15 @@ This simplicity is also the main risk. The same correction may not be appropriat
 
 Hinton's Forward-Forward algorithm is another useful comparison. It trains each layer using examples of “good” and “bad” data instead of sending an error backward through the whole network [[9](#references)]. We can test it later, after understanding the simpler rule above.
 
-### Proposed deep extension: reverse targets and local competition
+### Proposed deep extension: reverse targets and signed local correction
 
 The successful one-hidden-layer rule does not tell a deeper neuron which of
-its active incoming connections was responsible for a poor desired state. The
-deep experiment will therefore retain the ordinary active-connection
-correction while adding a second, neuron-local competition signal. For the
-recorded nonnegative contribution $q_{ij}$ of connection $i\rightarrow j$
-and desired neuron correction $d_j=h_j^*-h_j$, define
-
-$$
-r_{ij} = d_j q_{ij}
-$$
-
-A positive $r_{ij}$ means that the connection contributed while the neuron
-needed more output; a negative value means that it contributed while the
-neuron needed less. Each active connection keeps a PI history of this signal.
-Within each neuron, all currently positive connections receive a proportional
-bias reduction. Of the currently negative connections, the least-bad $N$
-receive only the ordinary correction and all worse-ranked connections receive
-a stronger bias increase. Inactive connections receive no correction and can
-later be physically removed. Thus $N$ is a tolerance for poorly scoring
-connections, not a hard cap on total fan-in: positive and neutral connections
-can survive in addition to those $N$.
-
-The PI history controls the magnitude and rank only while the current
-$r_{ij}$ is nonzero. This makes the reward stop when current evidence stops,
-while retaining history for later comparisons. $K_P$ and $K_I$ are global
-constants, with $K_I$ expected to be smaller; their useful range remains an
-experimental question rather than a convergence claim.
+its active incoming connections was responsible for a poor desired state.
+The deep experiment retains ordinary active-connection PI correction while
+using recorded contribution magnitudes to allocate correction between layers.
+The source neuron's fixed outgoing sign $s_i\in\{-1,+1\}$ reverses local
+correction for inhibitory paths. Inactive connections receive no correction
+and can later be physically removed.
 
 This resembles a neo-Hebbian three-factor learning rule, but only
 approximately. In that literature, correlated presynaptic and postsynaptic
@@ -122,6 +102,11 @@ plays the modulatory role, and the PI value supplies temporal memory. It is not
 an implementation of spike-timing-dependent plasticity, and the PI value is
 not an independent biological neuromodulator.
 
+An earlier design added a second PI trace and ranked harmful incoming edges
+within every neuron. It learned, but Gaussian structural locality now matches
+or exceeds it with less state and correction-time work. Its equations and
+measurements are retained in [Alternative designs](ALTERNATIVE_DESIGNS.md).
+
 The output target is the externally observed signed pixel error
 $e=\Delta_{\text{true}}-\Delta_{\text{predicted}}$. The positive and
 negative output channels receive corrections $[e,-e]$. After those output
@@ -129,7 +114,7 @@ connections are updated, their recorded contributions $q_{ij}$ assign a
 local correction to each neuron in the last hidden layer:
 
 $$
-C_i = \frac{\sum_j q_{ij} c_j}{\sum_j q_{ij} + \epsilon}, \qquad h_i^* = h_i + C_i
+C_i = \frac{\sum_j s_i q_{ij} c_j}{\sum_j q_{ij} + \epsilon}, \qquad h_i^* = h_i + C_i
 $$
 
 The incoming connections of that hidden layer are then updated toward
@@ -144,11 +129,17 @@ $$
 q_{ij} = \mathrm{ReLU}(h_i w_{ij} - b_{ij})
 $$
 
-the recorded contributions allocate the desired target among its active
-incoming edges:
+and the receiving neuron computes
 
 $$
-\alpha_{ij} = \frac{q_{ij}}{\sum_k q_{kj}}, \qquad q_{ij}^* = \alpha_{ij} h_j^*
+h_j = \mathrm{ReLU}\left(\sum_i s_i q_{ij}\right)
+$$
+
+the recorded magnitudes allocate a desired change among its active incoming
+edges:
+
+$$
+\alpha_{ij} = \frac{q_{ij}}{\sum_k q_{kj}}, \qquad q_{ij}^* = \max\left(0, q_{ij} + s_i\alpha_{ij}(h_j^*-h_j)\right)
 $$
 
 Each active edge then requests
@@ -160,6 +151,10 @@ $$
 Requests reaching the same source neuron from several downstream neurons are
 combined by an allocation-weighted average rather than a sum. A connection
 whose updated weight is at or below the configured minimum cannot be inverted.
+When every sign is positive, the implementation retains the original
+$q_{ij}^*=\alpha_{ij}h_j^*$ calculation exactly, avoiding an otherwise
+equivalent floating-point rearrangement that changes this discontinuous
+training trajectory.
 The backward run sets its weight to zero immediately, reallocates its target
 share across the remaining positive active edges, and leaves physical removal
 and PI-state cleanup to the next pruning cycle.
@@ -422,8 +417,7 @@ $$
 Every raw feature is connected to every input pixel. The true output is
 allocated over the recorded active contributions and inverted through
 already-updated connections to generate each preceding desired state. The
-local competition rule described above ranks only active incoming
-connections.
+ordinary PI rule corrects only active incoming connections.
 
 Before this correction, an initial tied-decoder implementation multiplied by
 the forward weights instead of dividing by them. Its five-seed baseline used
@@ -469,6 +463,77 @@ trajectory rises from `31.6%` at 2,000 observations to `78.7%` at 4,000 and
 `95.7%` at 8,000 before ending at `94.5%`. This is a large correction of an
 implementation mismatch, not yet a multi-seed result or evidence that inverse
 targets work through depth.
+
+The first fixed-inhibition experiment follows Dale's principle: a hidden
+neuron is assigned a permanent excitatory or inhibitory output sign, rather
+than learning independent signs for each outgoing connection. Purkinje cells
+provide a relevant but incomplete biological analogy because they combine
+very high input convergence with inhibitory output; granule and basket cells
+have different connectivity patterns, so “inhibitory means highly connected”
+is not a general cerebellar rule [[20](#references)].
+
+The initial inhibition sweeps were entangled with the now-removed ranked
+negative-feedback mechanism. Those measurements and the separate
+high-connectivity inhibitory-neuron variant are preserved in
+[Alternative designs](ALTERNATIVE_DESIGNS.md).
+
+The first structural-locality ablation replaces the complete bipartite layers
+with a fixed edge budget sampled without replacement from a Gaussian around
+each source neuron's proportionally mapped position:
+
+$$
+P(i\rightarrow j) \propto \exp\left(-\frac{(p_j-c_i)^2}{2\sigma^2}\right)
+$$
+
+This gives mostly short connections with occasional long-range tails rather
+than a hard neighborhood boundary. With 10% connectivity and $\sigma=0.1$,
+the two-hidden-layer graph starts with 1,908 connections instead of 17,856.
+To isolate topology, this first test uses no inhibitory neurons and no ranked
+negative-feedback competition.
+
+After 10,000 observations in the same seed, the dense $N=6$ control reaches
+`66.8%` one-step accuracy, `10.5%` rollout, and `0.021179` MSE in 48.8
+seconds. The local model reaches `28.1%`, `9.8%`, and `0.026590` in 18.2
+seconds. It retains 1,355 connections after ordinary inactivity pruning,
+versus 13,566 for the dense model. Its one-step accuracy is still rising at
+10,000 observations, so sparse locality has not prevented learning, but it
+has not preserved the dense model's immediate accuracy. A later hard local
+winner approximation of basket-cell inhibition failed and was removed; its
+results are recorded in
+[Unsuccessful and inconclusive experiments](UNSUCCESSFUL_EXPERIMENTS.md).
+
+Holding $\sigma=0.1$ fixed while sweeping connectivity from 10% to 100%
+finds a single-seed optimum at 50%. That model starts with 8,928 connections
+and retains 7,661 after pruning. It reaches `67.6%` one-step accuracy, `16.4%`
+rollout, and `0.019925` MSE. After the ranked mechanism and its second per-edge
+PI trace are physically removed, an isolated rerun takes 4.77 seconds and
+stores one PI scalar per surviving edge. This slightly exceeds the dense
+$N=6$ model on every measured accuracy metric while using 56.5% as many
+surviving connections and avoiding its per-neuron negative-feedback ranking.
+The nearby results are lower: 40% reaches `59.8%` one-step, 60% reaches
+`64.3%`, and 70% reaches `62.5%`. The 50% result is therefore the best tested
+trade-off for this seed, not yet a seed-independent optimum.
+
+Remeasuring fixed inhibition after removing ranked negative tolerance produces
+the strongest deep result so far. With 50% Gaussian locality and 6% inhibitory
+neurons, the model reaches `81.2%` one-step accuracy, `20.1%` rollout, and
+`0.017959` MSE while retaining 8,003 connections and training in 4.83 seconds.
+The matched dense 6%-inhibitory model reaches `75.6%`, `15.6%`, and `0.017844`
+with 14,540 connections in 6.82 seconds. The local positive-only model reaches
+`67.6%`, `16.4%`, and `0.019925`. In this seed, structural locality and
+fixed-sign inhibition therefore provide complementary gains; multi-seed
+verification is still required.
+
+Locality scope is configurable because shallow networks may need global
+input/output access for nonlocal tasks. In the current moving-dot seed,
+however, restricting only the hidden-to-hidden layer performs worse than
+applying 50% locality everywhere: hidden-only locality reaches `64.3%`
+one-step accuracy, `10.5%` rollout, and `0.021387` MSE while retaining 11,089
+connections. The all-layer model reaches `67.6%`, `16.4%`, and `0.019925`
+with 7,661 connections. For this spatially local motion task, local input
+receptive fields and local output projections are useful biases. Hidden-only
+scope remains available for future tasks where distant inputs must directly
+influence arbitrary outputs.
 
 With two hidden layers, the earlier small-weight initialization produced no
 active edges in hidden layer two or the output layer. Pruning removed all
@@ -558,3 +623,4 @@ The first version does not need to match backpropagation. Showing that local fee
 17. Miconi, T., Stanley, K. & Clune, J. (2018). [*Differentiable Plasticity: Training Plastic Neural Networks with Backpropagation*](https://proceedings.mlr.press/v80/miconi18a.html).
 18. Foster, D. J. & Wilson, M. A. (2006). [*Reverse Replay of Behavioural Sequences in Hippocampal Place Cells During the Awake State*](https://doi.org/10.1038/nature04587).
 19. Gerstner, W. et al. (2018). [*Eligibility Traces and Plasticity on Behavioral Time Scales: Experimental Support of NeoHebbian Three-Factor Learning Rules*](https://doi.org/10.3389/fncir.2018.00053).
+20. Apps, R. & Garwicz, M. (2005). [*Anatomical and Physiological Foundations of Cerebellar Information Processing*](https://doi.org/10.1038/nrn1646).

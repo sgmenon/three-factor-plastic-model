@@ -111,86 +111,6 @@ def test_output_target_is_canonical_positive_negative_encoding() -> None:
     assert torch.equal(desired[4:], torch.tensor([1.0, 0.0, 0.0, 0.0]))
 
 
-def test_negative_quota_penalizes_all_but_least_bad_n() -> None:
-    model = DeepMovingDotPredictor(
-        grid_size=1,
-        hidden_size=2,
-        hidden_layer_count=1,
-        negative_tolerance=10,
-    )
-    model.layers[0] = SparseConnectionLayer(
-        100,
-        1,
-        generator=torch.Generator().manual_seed(4),
-        weight_low=1.0,
-        weight_high=1.0,
-        bias_low=0.0,
-        bias_high=0.0,
-    )
-    current_feedback = torch.cat(
-        [
-            torch.tensor([3.0, 2.0, 1.0]),
-            torch.zeros(10),
-            -torch.arange(1.0, 88.0),
-        ]
-    )
-
-    adjustment, penalized = model._competition_bias_adjustment(
-        0,
-        current_feedback,
-        current_feedback,
-    )
-
-    assert penalized == 77
-    assert int((adjustment > 0).sum()) == 77
-    assert int((adjustment < 0).sum()) == 3
-    assert int((adjustment == 0).sum()) == 20
-
-
-def test_pi_history_does_not_act_when_current_feedback_is_zero() -> None:
-    model = DeepMovingDotPredictor(
-        grid_size=1,
-        hidden_size=2,
-        hidden_layer_count=1,
-    )
-    model.competition_integral[0].fill_(5.0)
-
-    pi_value = model._competition_pi(
-        0,
-        torch.zeros_like(model.competition_integral[0]),
-    )
-
-    assert torch.count_nonzero(pi_value) == 0
-    assert torch.all(model.competition_integral[0] == 5.0)
-
-
-def test_bias_penalty_can_close_edge_before_weight_update() -> None:
-    model = DeepMovingDotPredictor(
-        grid_size=1,
-        hidden_size=2,
-        hidden_layer_count=1,
-        negative_tolerance=0,
-        competition_proportional_gain=1.0,
-        competition_integral_gain=0.0,
-        severe_penalty_multiplier=4.0,
-    )
-    layer = model.layers[0]
-    layer.weight.fill_(1.0)
-    layer.bias.fill_(0.5)
-    old_weight = layer.weight.clone()
-
-    model._update_layer(
-        0,
-        torch.tensor([1.0]),
-        torch.tensor([-1.0]),
-        torch.tensor([True]),
-        torch.tensor([0.5]),
-    )
-
-    assert layer.bias.item() > 1.0
-    assert torch.equal(layer.weight, old_weight)
-
-
 def test_correction_updates_every_layer_without_autograd() -> None:
     model = DeepMovingDotPredictor(hidden_layer_count=2)
     generator = torch.Generator().manual_seed(31)
@@ -259,7 +179,7 @@ def test_inactivity_pruning_physically_filters_edges_and_state() -> None:
 
     assert pruned == 3
     assert [layer.edge_count for layer in model.layers] == [1, 1]
-    assert [state.numel() for state in model.competition_integral] == [1, 1]
+    assert [state.integral.numel() for state in model.bias_controllers] == [1, 1]
 
 
 def test_pruning_removes_active_edges_with_negligible_weight() -> None:
@@ -280,3 +200,134 @@ def test_pruning_removes_active_edges_with_negligible_weight() -> None:
 
     assert pruned == 2
     assert [layer.edge_count for layer in model.layers] == [0, 3]
+
+
+def test_inhibitory_neuron_sign_applies_to_every_outgoing_edge() -> None:
+    model = DeepMovingDotPredictor(
+        grid_size=1,
+        hidden_size=4,
+        hidden_layer_count=2,
+        inhibitory_fraction=0.5,
+    )
+    layer = model.layers[1]
+    layer.weight.fill_(1.0)
+    layer.bias.zero_()
+    source = torch.ones(4)
+
+    target, active, contribution = model._forward_layer(1, source)
+    source_sign = model.hidden_output_sign[0]
+
+    assert torch.count_nonzero(source_sign == -1) == 2
+    assert torch.all(
+        model._edge_sign(1)
+        == source_sign[layer.source_index]
+    )
+    assert torch.all(active)
+    assert torch.all(contribution == 1)
+    assert torch.all(target == 0)
+
+
+def test_inhibitory_edges_reverse_local_weight_and_bias_updates() -> None:
+    model = DeepMovingDotPredictor(
+        grid_size=1,
+        hidden_size=4,
+        hidden_layer_count=2,
+        inhibitory_fraction=0.5,
+        bias_proportional_gain=0.1,
+        bias_integral_gain=0.0,
+    )
+    layer = model.layers[1]
+    layer.weight.fill_(1.0)
+    layer.bias.fill_(0.5)
+    old_weight = layer.weight.clone()
+    old_bias = layer.bias.clone()
+    source = torch.ones(layer.source_count)
+    edge_sign = model._edge_sign(1)
+
+    model._update_layer(
+        1,
+        source,
+        torch.ones(layer.target_count),
+        torch.ones(layer.edge_count, dtype=torch.bool),
+    )
+
+    assert torch.all(layer.weight[edge_sign > 0] > old_weight[edge_sign > 0])
+    assert torch.all(layer.weight[edge_sign < 0] < old_weight[edge_sign < 0])
+    assert torch.all(layer.bias[edge_sign > 0] < old_bias[edge_sign > 0])
+    assert torch.all(layer.bias[edge_sign < 0] > old_bias[edge_sign < 0])
+
+
+def test_connectivity_summary_tracks_inhibitory_layers() -> None:
+    model = DeepMovingDotPredictor(
+        hidden_layer_count=2,
+        inhibitory_fraction=0.1,
+    )
+
+    summaries = model.neuron_class_connectivity()
+
+    assert len(summaries) == 2
+    assert summaries[0].inhibitory_neurons == 5
+    assert summaries[1].inhibitory_neurons == 10
+    assert summaries[0].inhibitory_mean_fan_in == 36
+    assert summaries[0].inhibitory_mean_fan_out == 192
+    assert summaries[1].inhibitory_mean_fan_in == 96
+    assert summaries[1].inhibitory_mean_fan_out == 72
+
+
+def test_gaussian_local_topology_has_fixed_sparse_edge_budget() -> None:
+    model = DeepMovingDotPredictor(
+        hidden_layer_count=2,
+        local_connectivity_fraction=0.1,
+    )
+
+    assert [layer.edge_count for layer in model.layers] == [180, 960, 768]
+    for layer, expected_fan_out in zip(model.layers, [5, 10, 8]):
+        fan_out = torch.bincount(
+            layer.source_index,
+            minlength=layer.source_count,
+        )
+        assert torch.all(fan_out == expected_fan_out)
+
+    output = model.layers[-1]
+    for source in range(output.source_count):
+        targets = output.target_index[output.source_index == source]
+        assert torch.count_nonzero(targets < model.pixel_count) == 4
+        assert torch.count_nonzero(targets >= model.pixel_count) == 4
+
+
+def test_gaussian_local_topology_is_seeded_but_not_fixed() -> None:
+    first = DeepMovingDotPredictor(
+        seed=7,
+        local_connectivity_fraction=0.1,
+    )
+    same = DeepMovingDotPredictor(
+        seed=7,
+        local_connectivity_fraction=0.1,
+    )
+    different = DeepMovingDotPredictor(
+        seed=8,
+        local_connectivity_fraction=0.1,
+    )
+
+    for first_layer, same_layer in zip(first.layers, same.layers):
+        assert torch.equal(first_layer.source_index, same_layer.source_index)
+        assert torch.equal(first_layer.target_index, same_layer.target_index)
+    assert any(
+        not torch.equal(first_layer.target_index, different_layer.target_index)
+        for first_layer, different_layer in zip(first.layers, different.layers)
+    )
+
+
+def test_hidden_only_locality_keeps_input_and_output_dense() -> None:
+    model = DeepMovingDotPredictor(
+        hidden_layer_count=2,
+        local_connectivity_fraction=0.5,
+        local_connectivity_sigma=0.1,
+        local_connectivity_scope="hidden",
+    )
+
+    assert [layer.edge_count for layer in model.layers] == [
+        36 * 48,
+        96 * 48,
+        96 * 72,
+    ]

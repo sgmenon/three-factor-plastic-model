@@ -67,6 +67,39 @@ Across five seeds after 10,000 observations, the dense hard-step model reached `
 
 No safe step-neuron merges appeared even with permissive similarity and reconstruction thresholds. The mechanism was both worse and substantially more complicated than ReLU, while a memoryless step is not a realistic spiking neuron. Step support and its special merge implementation were therefore removed from the active code. A future spiking experiment should model time, threshold crossing, and refractory state explicitly rather than reintroducing this simplified switch.
 
+## Hard local winner inhibition
+
+A basket-cell-inspired approximation made every hidden neuron advertise its
+candidate activation, then emit only if it ranked among the strongest neurons
+within a one-dimensional radius-four neighborhood. Physical pruning was
+disabled so that losing the local contest could not delete a neuron or its
+outgoing edges.
+
+The matched control used 50% Gaussian structural connectivity, 6% fixed-sign
+inhibitory neurons, and no pruning. It reached `77.3%` one-step accuracy,
+`16.6%` rollout, and `0.018338` MSE after 10,000 observations. Keeping only
+the strongest local candidate collapsed to `0%`, `7.0%`, and `0.047935`.
+Allowing two, three, and four winners reached only `1.0%`, `3.7%`, and `7.8%`
+one-step accuracy respectively.
+
+Hard winner suppression reduced active edge fractions so sharply that useful
+paths could not carry correction before specialization emerged. More
+fundamentally, the suppression operator was outside the graph understood by
+reverse replay. A neuron's output depended discontinuously on the relative
+ordering of all neighboring candidates, while backward correction assumed
+that each desired neuron state could be assigned through its own recorded
+incoming edges. It neither predicted winner-mask changes nor corrected losing
+neurons so they could become winners. Feedforward competition and backward
+targets were therefore inconsistent.
+
+The optional implementation was removed. This result rejects immediate hard
+top-$k$ suppression, not local inhibition generally. Explicit inhibitory
+neurons remain compatible because their signed effects are represented in the
+same connection graph used by forward and reverse propagation. Subtractive
+inhibition, homeostatic activity targets, gradual sparsity schedules, or
+inhibition added only after a warm-up period are materially different
+hypotheses.
+
 ## Reinforcing successful paths
 
 The motivation was to stabilize connections that participated in correct predictions. A stationary target should not earn reward merely because predicting no change was easy, so the first rule rewarded only meaningful target changes:
