@@ -6,7 +6,10 @@ from experiments.sparse_connections import SparseConnectionLayer
 
 
 def test_hidden_depth_is_configurable_and_layers_share_initial_ranges() -> None:
-    model = DeepMovingDotPredictor(hidden_layer_count=3)
+    model = DeepMovingDotPredictor(
+        hidden_layer_count=3,
+        bottleneck_fraction=0.0,
+    )
 
     assert model.hidden_layer_count == 3
     assert len(model.layers) == 4
@@ -20,7 +23,11 @@ def test_hidden_depth_is_configurable_and_layers_share_initial_ranges() -> None:
 
 
 def test_only_first_hidden_layer_has_temporal_residual_state() -> None:
-    model = DeepMovingDotPredictor(hidden_layer_count=2)
+    model = DeepMovingDotPredictor(
+        hidden_layer_count=2,
+        inhibitory_fraction=0.0,
+        bottleneck_fraction=0.0,
+    )
     previous = frame_from_state(DotState(2, 2, 1, 0), grid_size=6)
     current = frame_from_state(DotState(3, 2, 1, 0), grid_size=6)
 
@@ -29,7 +36,10 @@ def test_only_first_hidden_layer_has_temporal_residual_state() -> None:
     record = model.forward(current)
     current_raw, _ = model.layers[0].forward(current.flatten())
     change = current_raw - previous_raw
-    expected_first = torch.cat([torch.relu(change), torch.relu(-change)])
+    expected_first = torch.stack(
+        [torch.relu(change), torch.relu(-change)],
+        dim=1,
+    ).flatten()
     expected_second, _ = model.layers[1].forward(expected_first)
 
     assert torch.allclose(record.hidden[0], expected_first)
@@ -42,6 +52,7 @@ def test_backward_allocates_target_and_inverts_active_edges() -> None:
         grid_size=1,
         hidden_size=2,
         hidden_layer_count=1,
+        bottleneck_fraction=0.0,
     )
     model.layers[0] = SparseConnectionLayer(
         2,
@@ -75,6 +86,7 @@ def test_backward_deactivates_low_gain_and_reallocates_target() -> None:
         grid_size=1,
         hidden_size=2,
         hidden_layer_count=1,
+        bottleneck_fraction=0.0,
     )
     model.layers[0] = SparseConnectionLayer(
         2,
@@ -102,17 +114,30 @@ def test_backward_deactivates_low_gain_and_reallocates_target() -> None:
     assert torch.allclose(reconstructed, torch.tensor([5.0]))
 
 
-def test_output_target_is_canonical_positive_negative_encoding() -> None:
-    target_delta = torch.tensor([[-1.0, 0.0], [0.5, 0.0]])
+def test_backward_preserves_unconstrained_recorded_sources() -> None:
+    model = DeepMovingDotPredictor(
+        grid_size=1,
+        hidden_size=2,
+        hidden_layer_count=1,
+        bottleneck_fraction=0.0,
+    )
+    recorded_source = torch.tensor([2.0, 3.0])
 
-    desired = DeepMovingDotPredictor.output_target(target_delta)
+    desired_source = model.backward(
+        0,
+        torch.tensor([5.0]),
+        torch.zeros(model.layers[0].edge_count),
+        recorded_source,
+    )
 
-    assert torch.equal(desired[:4], torch.tensor([0.0, 0.0, 0.5, 0.0]))
-    assert torch.equal(desired[4:], torch.tensor([1.0, 0.0, 0.0, 0.0]))
+    assert torch.equal(desired_source, recorded_source)
 
 
 def test_correction_updates_every_layer_without_autograd() -> None:
-    model = DeepMovingDotPredictor(hidden_layer_count=2)
+    model = DeepMovingDotPredictor(
+        hidden_layer_count=2,
+        bottleneck_fraction=0.0,
+    )
     generator = torch.Generator().manual_seed(31)
     before = [layer.weight.clone() for layer in model.layers]
 
@@ -130,7 +155,10 @@ def test_correction_updates_every_layer_without_autograd() -> None:
 
 
 def test_one_hidden_layer_does_not_use_inverse_replay() -> None:
-    model = DeepMovingDotPredictor(hidden_layer_count=1)
+    model = DeepMovingDotPredictor(
+        hidden_layer_count=1,
+        bottleneck_fraction=0.0,
+    )
     generator = torch.Generator().manual_seed(37)
     previous, current, next_frame = sample_transition(generator, 6)
 
@@ -144,10 +172,47 @@ def test_one_hidden_layer_does_not_use_inverse_replay() -> None:
     )
 
 
+def test_bottleneck_path_uses_regular_inverse_replay() -> None:
+    model = DeepMovingDotPredictor(
+        hidden_size=20,
+        hidden_layer_count=1,
+        local_connectivity_fraction=0.5,
+    )
+    generator = torch.Generator().manual_seed(37)
+    previous, current, next_frame = sample_transition(generator, 6)
+    replayed_layers: list[int] = []
+    original_backward = model.backward
+
+    def track_backward(
+        layer_index: int,
+        desired_target: torch.Tensor,
+        recorded_contribution: torch.Tensor,
+        recorded_source: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        replayed_layers.append(layer_index)
+        return original_backward(
+            layer_index,
+            desired_target,
+            recorded_contribution,
+            recorded_source,
+        )
+
+    model.backward = track_backward  # type: ignore[method-assign]
+    model.correct(
+        model.record_from_pair(previous, current),
+        next_frame - current,
+    )
+
+    assert replayed_layers == [
+        model.bottleneck_layer_indices[0],
+    ]
+
+
 def test_frozen_hidden_control_updates_only_output_layer() -> None:
     model = DeepMovingDotPredictor(
         hidden_layer_count=2,
         update_hidden=False,
+        bottleneck_fraction=0.0,
     )
     generator = torch.Generator().manual_seed(41)
     before = [layer.weight.clone() for layer in model.layers]
@@ -169,6 +234,7 @@ def test_inactivity_pruning_physically_filters_edges_and_state() -> None:
         grid_size=1,
         hidden_size=2,
         hidden_layer_count=1,
+        bottleneck_fraction=0.0,
     )
     model.activity_observations = 10
     for counts in model.activity_counts:
@@ -187,6 +253,7 @@ def test_pruning_removes_active_edges_with_negligible_weight() -> None:
         grid_size=1,
         hidden_size=2,
         hidden_layer_count=1,
+        bottleneck_fraction=0.0,
     )
     model.activity_observations = 10
     for layer, counts in zip(model.layers, model.activity_counts):
@@ -208,6 +275,7 @@ def test_inhibitory_neuron_sign_applies_to_every_outgoing_edge() -> None:
         hidden_size=4,
         hidden_layer_count=2,
         inhibitory_fraction=0.5,
+        bottleneck_fraction=0.0,
     )
     layer = model.layers[1]
     layer.weight.fill_(1.0)
@@ -235,6 +303,7 @@ def test_inhibitory_edges_reverse_local_weight_and_bias_updates() -> None:
         inhibitory_fraction=0.5,
         bias_proportional_gain=0.1,
         bias_integral_gain=0.0,
+        bottleneck_fraction=0.0,
     )
     layer = model.layers[1]
     layer.weight.fill_(1.0)
@@ -261,6 +330,7 @@ def test_connectivity_summary_tracks_inhibitory_layers() -> None:
     model = DeepMovingDotPredictor(
         hidden_layer_count=2,
         inhibitory_fraction=0.1,
+        bottleneck_fraction=0.0,
     )
 
     summaries = model.neuron_class_connectivity()
@@ -278,6 +348,7 @@ def test_gaussian_local_topology_has_fixed_sparse_edge_budget() -> None:
     model = DeepMovingDotPredictor(
         hidden_layer_count=2,
         local_connectivity_fraction=0.1,
+        bottleneck_fraction=0.0,
     )
 
     assert [layer.edge_count for layer in model.layers] == [180, 960, 768]
@@ -291,22 +362,25 @@ def test_gaussian_local_topology_has_fixed_sparse_edge_budget() -> None:
     output = model.layers[-1]
     for source in range(output.source_count):
         targets = output.target_index[output.source_index == source]
-        assert torch.count_nonzero(targets < model.pixel_count) == 4
-        assert torch.count_nonzero(targets >= model.pixel_count) == 4
+        assert torch.count_nonzero(targets % 2 == 0) == 4
+        assert torch.count_nonzero(targets % 2 == 1) == 4
 
 
 def test_gaussian_local_topology_is_seeded_but_not_fixed() -> None:
     first = DeepMovingDotPredictor(
         seed=7,
         local_connectivity_fraction=0.1,
+        bottleneck_fraction=0.0,
     )
     same = DeepMovingDotPredictor(
         seed=7,
         local_connectivity_fraction=0.1,
+        bottleneck_fraction=0.0,
     )
     different = DeepMovingDotPredictor(
         seed=8,
         local_connectivity_fraction=0.1,
+        bottleneck_fraction=0.0,
     )
 
     for first_layer, same_layer in zip(first.layers, same.layers):
@@ -324,6 +398,7 @@ def test_hidden_only_locality_keeps_input_and_output_dense() -> None:
         local_connectivity_fraction=0.5,
         local_connectivity_sigma=0.1,
         local_connectivity_scope="hidden",
+        bottleneck_fraction=0.0,
     )
 
     assert [layer.edge_count for layer in model.layers] == [
@@ -331,3 +406,101 @@ def test_hidden_only_locality_keeps_input_and_output_dense() -> None:
         96 * 48,
         96 * 72,
     ]
+
+
+def test_bottleneck_model_shifts_learned_connections_to_pool_outputs() -> None:
+    model = DeepMovingDotPredictor(
+        hidden_size=20,
+        hidden_layer_count=2,
+        inhibitory_fraction=0.0,
+        local_connectivity_fraction=0.5,
+        local_connectivity_sigma=0.1,
+        bottleneck_fraction=0.5,
+    )
+
+    assert model.bottleneck_size == 10
+    assert model.hidden_layer_indices == [0, 2]
+    assert model.bottleneck_layer_indices == [1, 3]
+    assert [(layer.source_count, layer.target_count) for layer in model.layers] == [
+        (36, 10),
+        (20, 10),
+        (10, 20),
+        (20, 10),
+        (10, 72),
+    ]
+
+
+def test_enabling_bottlenecks_supplies_locality_defaults() -> None:
+    model = DeepMovingDotPredictor(
+        hidden_size=20,
+    )
+
+    assert model.local_connectivity_fraction == 0.1
+    assert model.local_connectivity_sigma == 0.1
+    assert model.bottleneck_fraction == 0.1
+    assert model.bottleneck_size == 2
+
+
+def test_bottleneck_width_is_independent_of_local_fanout() -> None:
+    model = DeepMovingDotPredictor(
+        hidden_size=100,
+        hidden_layer_count=1,
+        local_connectivity_fraction=0.2,
+        bottleneck_fraction=0.1,
+    )
+    bottleneck_layer = model.layers[model.bottleneck_layer_indices[0]]
+    fan_out = torch.bincount(
+        bottleneck_layer.source_index,
+        minlength=bottleneck_layer.source_count,
+    )
+
+    assert model.bottleneck_size == 10
+    assert torch.all(fan_out == 2)
+
+
+def test_bottleneck_features_can_have_fixed_inhibitory_outputs() -> None:
+    model = DeepMovingDotPredictor(
+        hidden_size=20,
+        hidden_layer_count=2,
+        inhibitory_fraction=0.2,
+        local_connectivity_fraction=0.2,
+        bottleneck_fraction=0.2,
+    )
+
+    assert [
+        int(mask.sum().item()) for mask in model.hidden_inhibitory
+    ] == [2, 1, 4, 1]
+    for layer_index in range(1, model.output_layer_index + 1):
+        layer = model.layers[layer_index]
+        assert torch.equal(
+            model._edge_sign(layer_index),
+            model.hidden_output_sign[layer_index - 1][
+                layer.source_index
+            ],
+        )
+        assert torch.any(model._edge_sign(layer_index) < 0)
+
+
+def test_bottleneck_model_corrects_without_autograd() -> None:
+    model = DeepMovingDotPredictor(
+        hidden_size=20,
+        hidden_layer_count=2,
+        inhibitory_fraction=0.0,
+        local_connectivity_fraction=0.2,
+    )
+    previous = frame_from_state(DotState(2, 2, 1, 0), grid_size=6)
+    current = frame_from_state(DotState(3, 2, 1, 0), grid_size=6)
+    following = frame_from_state(DotState(4, 2, 1, 0), grid_size=6)
+    for layer in model.layers:
+        layer.bias.zero_()
+    model.prime_state(previous)
+    record = model.forward(current)
+    old_biases = [layer.bias.clone() for layer in model.layers]
+
+    model.correct(record, following - current)
+
+    assert all(
+        torch.count_nonzero(layer.bias != old_bias).item() > 0
+        for layer, old_bias in zip(model.layers[1:], old_biases[1:])
+    )
+    assert all(layer.bias.grad is None for layer in model.layers)

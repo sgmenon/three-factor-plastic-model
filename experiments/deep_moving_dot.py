@@ -40,6 +40,9 @@ class DeepVideoRecord:
     previous_first_raw: Tensor
     raw_hidden: tuple[Tensor, ...]
     hidden: tuple[Tensor, ...]
+    bottleneck: tuple[Tensor, ...]
+    layer_source: tuple[Tensor, ...]
+    layer_target: tuple[Tensor, ...]
     output: Tensor
     predicted_delta: Tensor
     edge_active: tuple[Tensor, ...]
@@ -59,7 +62,6 @@ class NeuronClassConnectivity:
     top_inhibitory_fan_in: int
     top_inhibitory_fan_out: int
 
-
 class DeepMovingDotPredictor:
     """Symmetric hidden stack trained by tied reverse target generation."""
 
@@ -76,10 +78,11 @@ class DeepMovingDotPredictor:
         bias_integral_gain: float = 1.5e-4,
         bias_integral_decay: float = 0.99,
         bias_integral_limit: float = 20.0,
-        inhibitory_fraction: float = 0.0,
+        inhibitory_fraction: float = 0.06,
         local_connectivity_fraction: float | None = None,
         local_connectivity_sigma: float | None = None,
         local_connectivity_scope: str = "all",
+        bottleneck_fraction: float | None = None,
         minimum_weight: float = 1e-4,
         update_hidden: bool = True,
     ) -> None:
@@ -111,6 +114,11 @@ class DeepMovingDotPredictor:
             raise ValueError(
                 "Local connectivity scope must be 'all' or 'hidden'"
             )
+        if bottleneck_fraction is not None:
+            if not 0 <= bottleneck_fraction <= 1:
+                raise ValueError("Bottleneck fraction must be in [0, 1]")
+            if bottleneck_fraction > 0 and local_connectivity_fraction is None:
+                local_connectivity_fraction = 0.1
         generator = torch.Generator().manual_seed(seed)
         self.grid_size = grid_size
         self.pixel_count = grid_size * grid_size
@@ -133,6 +141,12 @@ class DeepMovingDotPredictor:
             else local_connectivity_sigma
         )
         self.local_connectivity_scope = local_connectivity_scope
+        self.bottleneck_fraction = bottleneck_fraction
+        self.bottleneck_size = (
+            max(1, ceil(bottleneck_fraction * hidden_size))
+            if bottleneck_fraction is not None
+            else None
+        )
         self.minimum_weight = minimum_weight
         self.update_hidden = update_hidden
 
@@ -150,8 +164,23 @@ class DeepMovingDotPredictor:
                 **hidden_arguments,
             )
         ]
+        self.hidden_layer_indices = [0]
+        self.bottleneck_layer_indices: list[int] = []
         source_count = hidden_size
-        for _ in range(1, hidden_layer_count):
+        for stage in range(hidden_layer_count):
+            if self.bottleneck_size is not None:
+                self.layers.append(
+                    SparseConnectionLayer(
+                        hidden_size,
+                        self.bottleneck_size,
+                        generator=generator,
+                        **hidden_arguments,
+                    )
+                )
+                self.bottleneck_layer_indices.append(len(self.layers) - 1)
+                source_count = self.bottleneck_size
+            if stage == hidden_layer_count - 1:
+                break
             self.layers.append(
                 SparseConnectionLayer(
                     source_count,
@@ -160,10 +189,11 @@ class DeepMovingDotPredictor:
                     **hidden_arguments,
                 )
             )
+            self.hidden_layer_indices.append(len(self.layers) - 1)
             source_count = hidden_size
         self.layers.append(
             SparseConnectionLayer(
-                hidden_size,
+                source_count,
                 self.output_size,
                 generator=generator,
                 weight_low=0.08,
@@ -197,6 +227,13 @@ class DeepMovingDotPredictor:
         type_generator = torch.Generator().manual_seed(seed + 1_000_003)
         hidden_target_sizes = [
             self.first_raw_size,
+            *(
+                [self.bottleneck_size, hidden_size]
+                * (hidden_layer_count - 1)
+            ),
+            *([self.bottleneck_size] if self.bottleneck_size is not None else []),
+        ] if self.bottleneck_size is not None else [
+            self.first_raw_size,
             *([hidden_size] * (hidden_layer_count - 1)),
         ]
         inhibitory_masks: list[Tensor] = []
@@ -211,26 +248,40 @@ class DeepMovingDotPredictor:
                 mask[selected] = True
             inhibitory_masks.append(mask)
         self.hidden_inhibitory = tuple(inhibitory_masks)
-        self.hidden_output_sign = (
-            torch.cat(
+        if self.bottleneck_layer_indices:
+            self.hidden_output_sign = tuple(
                 [
                     torch.where(
                         self.hidden_inhibitory[0],
                         -torch.ones(self.first_raw_size),
                         torch.ones(self.first_raw_size),
-                    ),
+                    ).repeat_interleave(2)
                 ]
-                * 2
-            ),
-            *(
+                + [
+                    torch.where(
+                        mask,
+                        -torch.ones(mask.numel()),
+                        torch.ones(mask.numel()),
+                    )
+                    for mask in self.hidden_inhibitory[1:]
+                ]
+            )
+        else:
+            self.hidden_output_sign = (
                 torch.where(
-                    mask,
-                    -torch.ones(mask.numel()),
-                    torch.ones(mask.numel()),
-                )
-                for mask in self.hidden_inhibitory[1:]
-            ),
-        )
+                    self.hidden_inhibitory[0],
+                    -torch.ones(self.first_raw_size),
+                    torch.ones(self.first_raw_size),
+                ).repeat_interleave(2),
+                *(
+                    torch.where(
+                        mask,
+                        -torch.ones(mask.numel()),
+                        torch.ones(mask.numel()),
+                    )
+                    for mask in self.hidden_inhibitory[1:]
+                ),
+            )
 
         controller_arguments = {
             "proportional_gain": bias_proportional_gain,
@@ -270,7 +321,7 @@ class DeepMovingDotPredictor:
         )
         if layer_index == 1:
             source_position = (
-                torch.arange(layer.source_count) % self.first_raw_size
+                torch.arange(layer.source_count) // 2
             )
             source_position = (
                 source_position.to(torch.float32) + 0.5
@@ -281,7 +332,6 @@ class DeepMovingDotPredictor:
             ) / layer.source_count
 
         if layer_index == self.output_layer_index:
-            group_size = self.pixel_count
             total_neighbors = max(
                 1,
                 ceil(fraction * layer.target_count),
@@ -289,8 +339,12 @@ class DeepMovingDotPredictor:
             first_group = (total_neighbors + 1) // 2
             neighbors_per_group = [first_group, total_neighbors - first_group]
             target_position = (
-                torch.arange(group_size, dtype=torch.float32) + 0.5
-            ) / group_size
+                torch.arange(
+                    self.pixel_count,
+                    dtype=torch.float32,
+                )
+                + 0.5
+            ) / self.pixel_count
             for source in range(layer.source_count):
                 distance = (target_position - source_position[source]).abs()
                 probability = torch.exp(
@@ -303,12 +357,12 @@ class DeepMovingDotPredictor:
                         continue
                     selected = torch.multinomial(
                         probability,
-                        min(neighbor_count, group_size),
+                        min(neighbor_count, self.pixel_count),
                         replacement=False,
                         generator=generator,
                     )
                     pair_mask[
-                        group * group_size + selected,
+                        2 * selected + group,
                         source,
                     ] = True
         else:
@@ -378,44 +432,70 @@ class DeepMovingDotPredictor:
         source = current_input
         raw_hidden: list[Tensor] = []
         hidden: list[Tensor] = []
+        bottleneck: list[Tensor] = []
+        layer_source: list[Tensor] = []
+        layer_target: list[Tensor] = []
         edge_active: list[Tensor] = []
         edge_contribution: list[Tensor] = []
 
-        for index, _layer in enumerate(self.layers[:-1]):
-            raw, active, contribution = self._forward_layer(index, source)
+        for stage, layer_index in enumerate(self.hidden_layer_indices):
+            layer_source.append(source)
+            raw, active, contribution = self._forward_layer(
+                layer_index,
+                source,
+            )
+            layer_target.append(raw)
             raw_hidden.append(raw)
             edge_active.append(active)
             edge_contribution.append(contribution)
-            if index == 0:
+            if stage == 0:
                 temporal_change = self.temporal_residual_gain * (
                     raw - previous_first_raw
                 )
-                state = torch.cat(
+                state = torch.stack(
                     [
                         torch.relu(temporal_change),
                         torch.relu(-temporal_change),
-                    ]
-                )
+                    ],
+                    dim=1,
+                ).flatten()
                 self.previous_first_raw = raw.clone()
             else:
                 state = raw
             hidden.append(state)
-            source = state
+            if self.bottleneck_layer_indices:
+                bottleneck_index = self.bottleneck_layer_indices[stage]
+                layer_source.append(state)
+                narrowed, active, contribution = self._forward_layer(
+                    bottleneck_index,
+                    state,
+                )
+                layer_target.append(narrowed)
+                bottleneck.append(narrowed)
+                edge_active.append(active)
+                edge_contribution.append(contribution)
+                source = narrowed
+            else:
+                source = state
 
+        layer_source.append(source)
         output, output_active, output_contribution = self._forward_layer(
             self.output_layer_index,
             source,
         )
+        layer_target.append(output)
         edge_active.append(output_active)
         edge_contribution.append(output_contribution)
-        predicted_delta = (
-            output[: self.pixel_count] - output[self.pixel_count :]
-        )
+        output_pairs = output.reshape(self.pixel_count, 2)
+        predicted_delta = output_pairs[:, 0] - output_pairs[:, 1]
         return DeepVideoRecord(
             current_input=current_input,
             previous_first_raw=previous_first_raw,
             raw_hidden=tuple(raw_hidden),
             hidden=tuple(hidden),
+            bottleneck=tuple(bottleneck),
+            layer_source=tuple(layer_source),
+            layer_target=tuple(layer_target),
             output=output,
             predicted_delta=predicted_delta.reshape(
                 self.grid_size,
@@ -436,18 +516,12 @@ class DeepMovingDotPredictor:
         self.previous_first_raw = saved_state
         return record
 
-    @staticmethod
-    def output_target(target_delta: Tensor) -> Tensor:
-        flat_target = target_delta.flatten()
-        return torch.cat(
-            [torch.relu(flat_target), torch.relu(-flat_target)]
-        )
-
     def backward(
         self,
         layer_index: int,
         desired_target: Tensor,
         recorded_contribution: Tensor,
+        recorded_source: Tensor | None = None,
     ) -> Tensor:
         """Approximate the source state that would produce desired_target."""
         layer = self.layers[layer_index]
@@ -514,30 +588,31 @@ class DeepMovingDotPredictor:
             layer.source_index,
             allocation,
         )
-        return (
+        desired_source = (
             desired_source_sum
             / desired_source_weight.clamp_min(1e-12)
         )
+        if recorded_source is not None:
+            desired_source = torch.where(
+                desired_source_weight > 0,
+                desired_source,
+                recorded_source,
+            )
+        return desired_source
 
     def _recorded_source(
         self,
         record: DeepVideoRecord,
         layer_index: int,
     ) -> Tensor:
-        if layer_index == 0:
-            return record.current_input
-        return record.hidden[layer_index - 1]
+        return record.layer_source[layer_index]
 
     def _recorded_target(
         self,
         record: DeepVideoRecord,
         layer_index: int,
     ) -> Tensor:
-        if layer_index == self.output_layer_index:
-            return record.output
-        if layer_index == 0:
-            return record.raw_hidden[0]
-        return record.hidden[layer_index]
+        return record.layer_target[layer_index]
 
     def _first_raw_target(
         self,
@@ -545,8 +620,12 @@ class DeepMovingDotPredictor:
         previous_first_raw: Tensor,
     ) -> Tensor:
         gain = self.temporal_residual_gain
-        positive = desired_first_hidden[: self.first_raw_size]
-        negative = desired_first_hidden[self.first_raw_size :]
+        desired_pairs = desired_first_hidden.reshape(
+            self.first_raw_size,
+            2,
+        )
+        positive = desired_pairs[:, 0]
+        negative = desired_pairs[:, 1]
         return (
             previous_first_raw + (positive - negative) / gain
         ).clamp_min(0.0)
@@ -592,11 +671,12 @@ class DeepMovingDotPredictor:
         flat_target = target_delta.flatten()
         error = flat_target - record.predicted_delta.flatten()
 
-        output_correction = torch.cat([error, -error])
+        output_correction = torch.stack([error, -error], dim=1).flatten()
         output_index = self.output_layer_index
+        last_source = record.layer_source[output_index]
         self._update_layer(
             output_index,
-            record.hidden[-1],
+            last_source,
             output_correction,
             record.edge_active[output_index],
         )
@@ -607,14 +687,14 @@ class DeepMovingDotPredictor:
             * self._edge_sign(output_index)
             * record.edge_active[output_index]
         )
-        hidden_correction_sum = torch.zeros(self.hidden_size)
+        hidden_correction_sum = torch.zeros(output_layer.source_count)
         hidden_correction_sum.scatter_add_(
             0,
             output_layer.source_index,
             output_edge_correction
             * record.edge_contribution[output_index],
         )
-        outgoing_contribution = torch.zeros(self.hidden_size)
+        outgoing_contribution = torch.zeros(output_layer.source_count)
         outgoing_contribution.scatter_add_(
             0,
             output_layer.source_index,
@@ -624,21 +704,49 @@ class DeepMovingDotPredictor:
             hidden_correction_sum
             / outgoing_contribution.clamp_min(1e-12)
         )
-        hidden_correction *= record.hidden[-1] > 0
-        desired_target = record.hidden[-1] + hidden_correction
+        hidden_correction *= last_source > 0
+        desired_target = last_source + hidden_correction
 
-        for layer_index in reversed(range(self.hidden_layer_count)):
+        for stage in reversed(range(self.hidden_layer_count)):
+            if self.bottleneck_layer_indices:
+                bottleneck_index = self.bottleneck_layer_indices[stage]
+                bottleneck_correction = (
+                    desired_target
+                    - self._recorded_target(record, bottleneck_index)
+                )
+                if self.update_hidden:
+                    self._update_layer(
+                        bottleneck_index,
+                        self._recorded_source(record, bottleneck_index),
+                        bottleneck_correction,
+                        record.edge_active[bottleneck_index],
+                    )
+                updated_contribution = (
+                    self.layers[bottleneck_index].edge_contribution(
+                        self._recorded_source(record, bottleneck_index)
+                    )
+                    * record.edge_active[bottleneck_index]
+                )
+                desired_hidden = self.backward(
+                    bottleneck_index,
+                    desired_target,
+                    updated_contribution,
+                    self._recorded_source(record, bottleneck_index),
+                )
+            else:
+                desired_hidden = desired_target
+            layer_index = self.hidden_layer_indices[stage]
             recorded_target = self._recorded_target(
                 record,
                 layer_index,
             )
-            if layer_index == 0:
+            if stage == 0:
                 desired_for_update = self._first_raw_target(
-                    desired_target,
+                    desired_hidden,
                     record.previous_first_raw,
                 )
             else:
-                desired_for_update = desired_target
+                desired_for_update = desired_hidden
             target_correction = desired_for_update - recorded_target
 
             if self.update_hidden:
@@ -649,11 +757,20 @@ class DeepMovingDotPredictor:
                     record.edge_active[layer_index],
                 )
 
-            if layer_index > 0:
+            if stage > 0:
+                replay_contribution = record.edge_contribution[layer_index]
+                if self.bottleneck_layer_indices:
+                    replay_contribution = (
+                        self.layers[layer_index].edge_contribution(
+                            self._recorded_source(record, layer_index)
+                        )
+                        * record.edge_active[layer_index]
+                    )
                 desired_target = self.backward(
                     layer_index,
-                    desired_target,
-                    record.edge_contribution[layer_index],
+                    desired_hidden,
+                    replay_contribution,
+                    self._recorded_source(record, layer_index),
                 )
 
         for index, active in enumerate(record.edge_active):
@@ -705,6 +822,8 @@ class DeepMovingDotPredictor:
         self,
     ) -> tuple[NeuronClassConnectivity, ...]:
         """Summarize post-pruning fan-in and fan-out by hidden neuron type."""
+        if self.bottleneck_layer_indices:
+            return ()
         summaries: list[NeuronClassConnectivity] = []
         for layer_index, inhibitory in enumerate(self.hidden_inhibitory):
             neuron_count = inhibitory.numel()
@@ -714,7 +833,7 @@ class DeepMovingDotPredictor:
             )
             outgoing_source = self.layers[layer_index + 1].source_index
             if layer_index == 0:
-                outgoing_source = outgoing_source % self.first_raw_size
+                outgoing_source = outgoing_source // 2
             outgoing = torch.bincount(
                 outgoing_source,
                 minlength=neuron_count,
@@ -868,6 +987,7 @@ def run_online_experiment(
     local_connectivity_fraction: float | None = None,
     local_connectivity_sigma: float | None = None,
     local_connectivity_scope: str = "all",
+    bottleneck_fraction: float = 0.1,
     update_hidden: bool = True,
     pruning_interval: int | None = None,
     minimum_activity_rate: float = 0.001,
@@ -888,6 +1008,7 @@ def run_online_experiment(
         local_connectivity_fraction=local_connectivity_fraction,
         local_connectivity_sigma=local_connectivity_sigma,
         local_connectivity_scope=local_connectivity_scope,
+        bottleneck_fraction=bottleneck_fraction,
         minimum_weight=minimum_weight,
         update_hidden=update_hidden,
     )
@@ -946,13 +1067,24 @@ def main() -> None:
     parser.add_argument("--hidden-size", type=int, default=96)
     parser.add_argument("--hidden-layers", type=int, default=2)
     parser.add_argument("--inhibitory-fraction", type=float, default=0.06)
-    parser.add_argument("--local-connectivity", type=float, default=None)
-    parser.add_argument("--local-connectivity-sigma", type=float, default=None)
+    parser.add_argument(
+        "--local-connectivity",
+        type=float,
+        default=None,
+        help="fraction of learned edges retained per source neuron",
+    )
+    parser.add_argument(
+        "--local-connectivity-sigma",
+        type=float,
+        default=None,
+        help="spatial spread of learned local edges on a normalized layer",
+    )
     parser.add_argument(
         "--local-connectivity-scope",
         choices=["all", "hidden"],
         default="all",
     )
+    parser.add_argument("--bottleneck-fraction", type=float, default=None)
     parser.add_argument("--pruning-interval", type=int, default=1000)
     parser.add_argument("--no-pruning", action="store_true")
     parser.add_argument("--minimum-activity-rate", type=float, default=0.001)
@@ -969,6 +1101,7 @@ def main() -> None:
         local_connectivity_fraction=args.local_connectivity,
         local_connectivity_sigma=args.local_connectivity_sigma,
         local_connectivity_scope=args.local_connectivity_scope,
+        bottleneck_fraction=args.bottleneck_fraction,
         update_hidden=not args.freeze_hidden,
         pruning_interval=(
             None if args.no_pruning else args.pruning_interval
@@ -995,6 +1128,17 @@ def main() -> None:
         )
     )
     print(f"Hidden updates:        {model.update_hidden}")
+    print(
+        "Learned bottlenecks:  "
+        + (
+            " off"
+            if not model.bottleneck_layer_indices
+            else (
+                f" {model.bottleneck_fraction:.1%}, "
+                f"features={model.bottleneck_size}, learned sparse"
+            )
+        )
+    )
     print(f"Autograd used:         no")
     print(f"Final MSE:             {mse:.6f}")
     print(f"Persistence MSE:       {persistence_mse:.6f}")

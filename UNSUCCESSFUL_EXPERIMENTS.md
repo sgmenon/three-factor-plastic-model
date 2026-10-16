@@ -154,6 +154,26 @@ Across five seeds with pruning every 1,000 observations:
 
 Signed-score pruning remains optional in the experiment code but is disabled by default.
 
+## Fixed max-and-leak microcolumn bottlenecks
+
+A parameter-free bottleneck emitted each local pool's maximum activation plus
+0.3 times its normalized losing activity. Adjacent pools were first represented
+by explicit bridge outputs and later by overlapping candidate windows. Several
+reverse rules were tested: independent sensitivity requests, a joint
+minimum-norm pseudoinverse, additive contribution credit, and fixed-leakage
+gain inversion.
+
+The strongest early approximate-replay run reached only `4.5%` one-step
+accuracy. The mathematically stricter pseudoinverse became unstable, briefly
+reaching `4.7%` while MSE spiked to `0.277586` before collapse. Additive
+fixed-gain correction with 300 hidden values and 20% locality remained at
+`0.0%` one-step accuracy and `0.049747` MSE after 10,000 observations.
+
+The mechanism repeatedly made forward competition and reverse credit depend
+on different abstractions. It was removed in favor of ordinary learned sparse
+bottleneck layers, which use the same connection equation and inverse replay
+as the rest of the model.
+
 ## Connection-pair merging
 
 The first merging rule compared historical contributions from pairs of connections entering the same neuron. Pairs needed at least `95%` cosine similarity, and a fitted survivor needed relative reconstruction error no greater than `10%`.

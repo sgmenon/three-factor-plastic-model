@@ -414,6 +414,12 @@ $$
 h_1[k] = \left[\mathrm{ReLU}(u[k] - u[k-1]), \mathrm{ReLU}(u[k-1] - u[k])\right]
 $$
 
+The two directions are interleaved by feature rather than stored in separate
+positive and negative blocks. Output delta channels use the same per-pixel
+interleaving. This preserves spatial adjacency for Gaussian local
+connectivity: the positive and negative forms of one feature or pixel occupy
+neighboring positions.
+
 Every raw feature is connected to every input pixel. The true output is
 allocated over the recorded active contributions and inverted through
 already-updated connections to generate each preceding desired state. The
@@ -523,6 +529,97 @@ with 14,540 connections in 6.82 seconds. The local positive-only model reaches
 `67.6%`, `16.4%`, and `0.019925`. In this seed, structural locality and
 fixed-sign inhibition therefore provide complementary gains; multi-seed
 verification is still required.
+
+### Learned sparse bottlenecks
+
+The active depth experiment inserts one ordinary learned sparse layer after
+every hidden stage:
+
+$$
+H_i \rightarrow B_i \rightarrow H_{i+1}.
+$$
+
+For hidden width $H$ and bottleneck fraction $r$, each bottleneck has
+$\lceil rH\rceil$ neurons; $r$ defaults to 10%. This width is independent of
+the locality fraction $f$, which controls each source neuron's fanout into the
+next layer. Bottleneck connections use the same nonnegative ReLU contribution,
+per-edge weight and bias, PI correction, fixed output sign, Gaussian
+structural locality, physical pruning, and inverse replay as every other
+learned layer. There is no max operator, leakage coefficient, bridge feature,
+or special reverse equation. The default 10% bottleneck fraction enables the
+layers and defaults locality and sigma to 10%; setting the fraction to zero
+disables them, while explicit locality options override the topology defaults.
+
+This is less biologically specific than the fixed microcolumn proposal, but
+it makes forward inference and reverse replay use exactly the same represented
+connection graph. The cost is more learned connections; structural sparsity
+and later removal of disconnected neurons are expected to control that cost.
+
+The first learned-bottleneck run uses hidden width 300, 20% locality, and two
+hidden/bottleneck pairs. After 10,000 observations it reaches `0.2%` one-step
+accuracy, `7.0%` rollout, and `0.048481` MSE while pruning from 12,780 to
+8,559 learned edges in `7.61 s`. Residual error improves steadily, but useful
+position convergence has not yet emerged.
+
+#### Retired fixed max-pool prototypes
+
+The first two-hidden-layer prototype, using the earlier independently
+configured 10% microcolumn width, did **not** meet that criterion. With
+$\sigma=0.1$, $\kappa=0.3$, 50% Gaussian learned connectivity, and no
+fixed-sign inhibitory neurons, each 96-value hidden state was compressed to
+19 bottleneck features. After 10,000 observations it reached
+`0.2%` one-step accuracy, `7.0%` rollout accuracy, and `0.052337` MSE with
+2,198 surviving learned edges. The matched model without bottlenecks reaches
+`67.6%`, `16.4%`, and `0.019925` with 7,661 edges. The prototype is also
+slower (`11.65 s` versus `4.43 s`) because its small fixed pools currently use
+Python loops.
+
+This is evidence against this **degree of compression**, not yet against
+represented lateral competition in general. The transformation preserves
+local correction mathematically, but 19 pooled values discard most of the
+96-dimensional hidden representation before the next learned layer. Any
+follow-up should first vary bottleneck width or retain multiple winners per
+microcolumn; it should not tune correction gains until the information
+bottleneck itself is controlled.
+
+An intermediate shared-connectivity formulation removed that narrow-width
+confound but added a separate bridge output for every adjacent pair: 50%
+connectivity produced 48 primary plus 47 bridge features (`95` total). It
+still failed after 10,000 observations, reaching `0.0%` one-step accuracy,
+`7.0%` rollout, and `0.055415` MSE. Ordinary pruning reduced 8,844 learned
+edges to 2,264, and training took `68.49 s`. Width alone therefore was not
+the failure. That explicit-bridge design has now been replaced by direct
+overlap between the 48 bottleneck windows.
+
+The 50%-overlapping-window replacement improves substantially over explicit
+bridges but remains weak under the current approximate reverse replay. After
+10,000 observations it reaches `4.5%` one-step accuracy, `8.2%` rollout, and
+`0.041068` MSE with 4,372 surviving learned edges in `28.18 s`. MSE and
+accuracy are still improving at the endpoint, but this remains far below the
+matched no-bottleneck model. This result motivated a review of output inverse
+and overlap attribution before further topology tuning.
+
+An intermediate correction attempt inverted updated output connections but
+then treated overlapping fixed pools as one global linear inverse. Its
+minimum-norm pseudoinverse briefly reached `4.7%` accuracy while MSE spiked to
+`0.277586`, then collapsed to persistence. That rule was removed because it
+solved a different objective: overlap represents multiple outgoing paths
+whose contribution-based corrections should add, not constraints that should
+be jointly deduplicated.
+
+With additive contribution credit restored, the matched 10,000-observation
+run is stable but still not useful: MSE falls to `0.050301`, one-step accuracy
+remains `0.0%`, and rollout reaches `5.1%`. It retains 4,041 of 4,896 learned
+edges in `27.74 s`. This beats persistence in residual MSE but falls below it
+in rollout position, so the corrected rule has not yet solved deep credit
+assignment.
+
+Inverting the fixed leakage gain and widening to 300 hidden values with 20%
+local connectivity produces 60 bottleneck features. After 10,000 observations
+it reaches `0.049747` MSE, `0.0%` one-step accuracy, and `6.4%` rollout while
+retaining 5,040 of 5,580 learned edges. The residual improves steadily, but
+the representation still does not identify the next position. Correcting the
+fixed-gain units was necessary, but it is not sufficient.
 
 Locality scope is configurable because shallow networks may need global
 input/output access for nonlocal tasks. In the current moving-dot seed,
